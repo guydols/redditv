@@ -311,6 +311,16 @@
                 return null;
             }
 
+            // Poll generation: each sub switch bumps this; stale poll loops abort.
+            let switchSeq = 0;
+            let retryCountdownTimer = null;
+            const POLL_INTERVAL_MS = 2500;
+            const POLL_MAX_MS = 90000;
+
+            function sleep(ms) {
+                return new Promise((r) => setTimeout(r, ms));
+            }
+
             async function fetchVideosPage(subreddit, after, refresh) {
                 const params = new URLSearchParams({ sub: subreddit, limit: "25" });
                 if (after) params.set("after", after);
@@ -318,30 +328,82 @@
                 // scroll and sub switches always use refresh=false (cache).
                 params.set("refresh", refresh ? "true" : "false");
                 const response = await fetch(`/api/videos?${params.toString()}`);
-                const data = await response.json();
+                const data = await response.json().catch(() => ({}));
                 if (!response.ok) {
+                    const errBody = data && data.error ? data.error : {};
                     const msg =
-                        data && data.error && data.error.message
-                            ? data.error.message
-                            : `Request failed (${response.status})`;
-                    throw new Error(msg);
+                        errBody.message ||
+                        `Request failed (${response.status})`;
+                    const err = new Error(msg);
+                    err.status = response.status;
+                    err.retryAfterMs =
+                        errBody.retryAfterMs != null
+                            ? Number(errBody.retryAfterMs)
+                            : null;
+                    err.data = data;
+                    throw err;
                 }
                 updateFreshBadge(data);
                 return data;
             }
 
+            function clearRetryCountdown() {
+                if (retryCountdownTimer) {
+                    clearInterval(retryCountdownTimer);
+                    retryCountdownTimer = null;
+                }
+            }
+
+            function showRetryCountdown(ms) {
+                const badge = document.getElementById("freshBadge");
+                if (!badge) return;
+                clearRetryCountdown();
+                if (ms == null || !(ms > 0)) return;
+                let remain = Math.ceil(ms / 1000);
+                const base = badge.textContent;
+                const tick = () => {
+                    badge.textContent = `${base} (retry in ${remain}s)`;
+                    if (remain <= 0) {
+                        clearRetryCountdown();
+                        return;
+                    }
+                    remain--;
+                };
+                tick();
+                retryCountdownTimer = setInterval(tick, 1000);
+            }
+
             function updateFreshBadge(data) {
                 const badge = document.getElementById("freshBadge");
                 if (!badge) return;
+                clearRetryCountdown();
+                data = data || {};
+                const isLoading = !!data.loading;
+                const rows = data.videos ? data.videos.length : 0;
                 const stale = !!data.stale;
                 const when = data.fetchedAt
                     ? new Date(data.fetchedAt).toLocaleTimeString()
                     : "never";
-                badge.textContent = stale ? `Stale (fetched ${when})` : `Fresh (fetched ${when})`;
-                badge.dataset.state = stale ? "stale" : "fresh";
-                badge.title = data.cached
-                    ? "Served from the 1h server cache"
-                    : "Fresh fetch";
+                if (isLoading && rows === 0) {
+                    badge.textContent = `Loading… (fetched ${when})`;
+                    badge.dataset.state = "loading";
+                    badge.title = "Background fetch running — polling…";
+                } else if (isLoading) {
+                    badge.textContent = stale
+                        ? `Refreshing… (fetched ${when})`
+                        : `Refreshing… (fetched ${when})`;
+                    badge.dataset.state = "refreshing";
+                    badge.title = "Showing cached rows while fresh data loads";
+                } else {
+                    badge.textContent = stale ? `Stale (fetched ${when})` : `Fresh (fetched ${when})`;
+                    badge.dataset.state = stale ? "stale" : "fresh";
+                    badge.title = data.cached
+                        ? "Served from the 1h server cache"
+                        : "Fresh fetch";
+                }
+                if (data.retryAfterMs != null && Number(data.retryAfterMs) > 0) {
+                    showRetryCountdown(Number(data.retryAfterMs));
+                }
             }
 
             function mapBackendVideo(v) {
@@ -371,6 +433,7 @@
             }
 
             async function fetchSubreddit(subreddit) {
+                const mySeq = ++switchSeq;
                 currentSub = subreddit;
                 afterCursor = null;
                 hasMore = false;
@@ -380,56 +443,282 @@
                 // then render the first slice when ready.
                 playlist.innerHTML =
                     '<div class="loading">Loading videos...</div>';
+                updateFreshBadge({ stale: true, loading: true, videos: [], fetchedAt: null });
                 try {
                     let data = await fetchVideosPage(subreddit, null, false);
-                    // Stale/missing cache returns {videos: [], loading:true}
-                    // while the background job runs: poll once after 2s.
-                    if (
-                        data.loading &&
-                        (!data.videos || data.videos.length === 0)
-                    ) {
-                        await new Promise((r) => setTimeout(r, 2000));
-                        data = await fetchVideosPage(subreddit, null, false);
+                    if (mySeq !== switchSeq) return;
+                    const rows = data.videos || [];
+                    if (rows.length > 0) {
+                        // Stale-but-non-empty: render now so the player starts
+                        // instantly, then poll in the background for the fresh
+                        // head-merge without resetting playback.
+                        videos = rows.map(mapBackendVideo);
+                        afterCursor = data.after || null;
+                        // loading:true with no index cursor still means more
+                        // may arrive (background job / reddit_after cursor).
+                        hasMore = !!data.hasMore || !!data.loading;
+                        renderPlaylist();
+                        observeSentinel();
+                        playVideo(0);
+                        if (data.loading) {
+                            pollForHeadUpdate(subreddit, mySeq);
+                        }
+                        return;
                     }
-                    videos = (data.videos || []).map(mapBackendVideo);
+                    if (data.loading) {
+                        // Empty + loading: background scrape still running
+                        // (12s fast nav + 45s rate gate + pagination). Poll
+                        // every ~2.5s up to ~90s for the first non-empty slice.
+                        await pollUntilNonEmpty(subreddit, mySeq);
+                        return;
+                    }
+                    // Empty and not loading: genuinely no videos.
+                    hasMore = !!data.hasMore;
                     afterCursor = data.after || null;
-                    // loading:true with no index cursor still means more may
-                    // arrive (background job pending / reddit_after cursor).
-                    hasMore = !!data.hasMore || !!data.loading;
                     renderPlaylist();
                     observeSentinel();
-                    if (videos.length > 0) {
-                        playVideo(0);
-                    } else if (data.loading) {
-                        playlist.innerHTML =
-                            '<div class="loading">Loading videos...</div>';
-                    }
                 } catch (error) {
+                    if (mySeq !== switchSeq) return;
+                    console.error("Error fetching subreddit:", error);
+                    if (error && error.status === 429 && error.retryAfterMs) {
+                        playlist.innerHTML =
+                            '<div class="loading">Rate limited. Retrying…</div>';
+                        showRetryCountdown(error.retryAfterMs);
+                        await sleep(Math.min(error.retryAfterMs, 15000));
+                        if (mySeq !== switchSeq) return;
+                        // Re-enter the switch flow (bumps seq again is wrong,
+                        // so recurse via a fresh poll attempt).
+                        return fetchSubredditRetry(subreddit, mySeq);
+                    }
+                    playlist.innerHTML =
+                        '<div class="loading">Error loading videos. Try another subreddit.</div>';
+                }
+            }
+
+            // Retry entry that keeps the current poll generation alive.
+            async function fetchSubredditRetry(subreddit, mySeq) {
+                if (mySeq !== switchSeq) return;
+                try {
+                    const data = await fetchVideosPage(subreddit, null, false);
+                    if (mySeq !== switchSeq) return;
+                    const rows = data.videos || [];
+                    if (rows.length > 0) {
+                        videos = rows.map(mapBackendVideo);
+                        afterCursor = data.after || null;
+                        hasMore = !!data.hasMore || !!data.loading;
+                        renderPlaylist();
+                        observeSentinel();
+                        playVideo(0);
+                        if (data.loading) pollForHeadUpdate(subreddit, mySeq);
+                        return;
+                    }
+                    if (data.loading) {
+                        await pollUntilNonEmpty(subreddit, mySeq);
+                        return;
+                    }
+                    hasMore = !!data.hasMore;
+                    afterCursor = data.after || null;
+                    renderPlaylist();
+                    observeSentinel();
+                } catch (error) {
+                    if (mySeq !== switchSeq) return;
                     console.error("Error fetching subreddit:", error);
                     playlist.innerHTML =
                         '<div class="loading">Error loading videos. Try another subreddit.</div>';
                 }
             }
 
+            // Poll while (loading && empty) up to ~90s; auto-play first slice.
+            async function pollUntilNonEmpty(subreddit, mySeq) {
+                const deadline = Date.now() + POLL_MAX_MS;
+                while (Date.now() < deadline) {
+                    if (mySeq !== switchSeq) return;
+                    await sleep(POLL_INTERVAL_MS);
+                    if (mySeq !== switchSeq) return;
+                    let data;
+                    try {
+                        data = await fetchVideosPage(subreddit, null, false);
+                    } catch (error) {
+                        if (error && error.status === 429 && error.retryAfterMs) {
+                            showRetryCountdown(error.retryAfterMs);
+                        }
+                        continue;
+                    }
+                    if (mySeq !== switchSeq) return;
+                    const rows = data.videos || [];
+                    if (rows.length > 0) {
+                        videos = rows.map(mapBackendVideo);
+                        afterCursor = data.after || null;
+                        hasMore = !!data.hasMore || !!data.loading;
+                        renderPlaylist();
+                        observeSentinel();
+                        playVideo(0);
+                        if (data.loading) pollForHeadUpdate(subreddit, mySeq);
+                        return;
+                    }
+                    if (!data.loading) {
+                        // Job finished with nothing: show empty state.
+                        hasMore = !!data.hasMore;
+                        afterCursor = data.after || null;
+                        renderPlaylist();
+                        observeSentinel();
+                        return;
+                    }
+                    // Still loading+empty: keep the Loading indicator alive.
+                    playlist.innerHTML =
+                        '<div class="loading">Loading videos...</div>';
+                }
+                // Timed out after ~90s: leave a retry affordance, keep cursor.
+                if (mySeq !== switchSeq) return;
+                playlist.innerHTML =
+                    '<div class="loading">Still loading — <a href="#" id="retryLoad" style="color:#4a9eff">retry</a></div>';
+                const retry = document.getElementById("retryLoad");
+                if (retry) {
+                    retry.addEventListener("click", (e) => {
+                        e.preventDefault();
+                        fetchSubreddit(subreddit);
+                    });
+                }
+            }
+
+            // Stale non-empty rendered: keep polling for the fresh head-merge,
+            // then merge unseen rows without disturbing playback.
+            async function pollForHeadUpdate(subreddit, mySeq) {
+                const deadline = Date.now() + POLL_MAX_MS;
+                while (Date.now() < deadline) {
+                    if (mySeq !== switchSeq || subreddit !== currentSub) return;
+                    await sleep(POLL_INTERVAL_MS);
+                    if (mySeq !== switchSeq || subreddit !== currentSub) return;
+                    let data;
+                    try {
+                        data = await fetchVideosPage(subreddit, null, false);
+                    } catch {
+                        continue;
+                    }
+                    if (mySeq !== switchSeq || subreddit !== currentSub) return;
+                    const fresh = (data.videos || []).map(mapBackendVideo);
+                    if (fresh.length > videos.length) {
+                        const playingId =
+                            videos[currentIndex] &&
+                            (videos[currentIndex].youtubeId ||
+                                videos[currentIndex].url);
+                        const added = appendUnique(fresh);
+                        // Server head-merges newest-first; if the head slice
+                        // grew, adopt the fresh cursor/tail state.
+                        if (data.after !== undefined) {
+                            afterCursor = data.after || afterCursor;
+                        }
+                        hasMore = !!data.hasMore || !!data.loading;
+                        // Preserve the playing item after merge.
+                        if (playingId) {
+                            const idx = videos.findIndex(
+                                (v) =>
+                                    (v.youtubeId || v.url) === playingId,
+                            );
+                            if (idx >= 0) currentIndex = idx;
+                        }
+                        if (added > 0) renderPlaylistPreserve();
+                        else {
+                            hasMore = !!data.hasMore || !!data.loading;
+                        }
+                    } else {
+                        hasMore = !!data.hasMore || !!data.loading;
+                        if (data.after !== undefined && data.after) {
+                            afterCursor = afterCursor || data.after;
+                        }
+                    }
+                    if (!data.loading) {
+                        renderPlaylistPreserve();
+                        observeSentinel();
+                        return;
+                    }
+                }
+            }
+
             async function loadMore() {
                 if (loading || !hasMore) return;
+                // Avoid overlapping tail-fill retries racing the sentinel.
                 loading = true;
                 const sentinel = document.getElementById("playlistSentinel");
                 if (sentinel) sentinel.textContent = "Loading more…";
                 try {
                     const data = await fetchVideosPage(currentSub, afterCursor, false);
                     const more = (data.videos || []).map(mapBackendVideo);
-                    appendUnique(more);
-                    afterCursor = data.after || null;
+                    const before = videos.length;
+                    const added = appendUnique(more);
+                    if (more.length > 0) {
+                        // Advance the cursor only when the server actually
+                        // returned rows; an empty slice with loading:true means
+                        // the background paginate job hasn't filled the tail
+                        // yet — keep the old cursor so the retry re-asks the
+                        // same tail position.
+                        afterCursor = data.after || null;
+                    } else if (data.after) {
+                        afterCursor = data.after;
+                    } else if (!(data.hasMore || data.loading)) {
+                        afterCursor = null;
+                    }
                     // Keep paging while the server has an index tail, a
                     // reddit_after cursor, or a background job pending.
                     hasMore = !!data.hasMore || !!data.loading;
-                    renderPlaylist();
+                    if (added > 0 || before === 0) {
+                        renderPlaylistPreserve();
+                    } else {
+                        renderPlaylistPreserve();
+                    }
                     observeSentinel();
+                    if (added === 0 && data.loading && hasMore) {
+                        // Tail-fill pending: schedule one follow-up poll so the
+                        // playlist appends without requiring a user scroll.
+                        const sub = currentSub;
+                        setTimeout(() => {
+                            if (sub !== currentSub) return;
+                            loading = false;
+                            loadMore();
+                        }, POLL_INTERVAL_MS);
+                        return;
+                    }
                 } catch (error) {
                     console.error("Error loading more videos:", error);
+                    if (error && error.status === 429 && error.retryAfterMs) {
+                        showRetryCountdown(error.retryAfterMs);
+                        const sub = currentSub;
+                        setTimeout(() => {
+                            if (sub !== currentSub) return;
+                            loading = false;
+                            if (hasMore) loadMore();
+                        }, Math.min(error.retryAfterMs, 15000));
+                        return;
+                    }
                 } finally {
                     loading = false;
+                }
+            }
+
+            // Re-render the playlist without yanking the user's scroll: keep
+            // the active highlight, preserve scrollLeft, and only scroll the
+            // active item into view when the user is already at the end.
+            function renderPlaylistPreserve() {
+                const atEnd =
+                    playlist.scrollLeft + playlist.clientWidth >
+                    playlist.scrollWidth - 400;
+                const savedScroll = playlist.scrollLeft;
+                renderPlaylist();
+                if (atEnd) {
+                    const items =
+                        document.querySelectorAll(".playlist-item");
+                    const active = items[currentIndex];
+                    if (active) {
+                        active.scrollIntoView({
+                            behavior: "smooth",
+                            block: "nearest",
+                            inline: "center",
+                        });
+                    } else {
+                        playlist.scrollLeft = playlist.scrollWidth;
+                    }
+                } else {
+                    playlist.scrollLeft = savedScroll;
                 }
             }
 
@@ -561,8 +850,9 @@
                     });
                 }
 
-                // Endless: prefetch next page when nearing the end
-                if (index >= videos.length - 3) {
+                // Endless: prefetch next page when nearing the end (within 5
+                // of the tail, or via the sentinel / onEnded path below).
+                if (hasMore && index >= videos.length - 5) {
                     loadMore();
                 }
             }
@@ -578,9 +868,28 @@
                 if (currentIndex < videos.length - 1) {
                     playVideo(currentIndex + 1);
                 } else if (hasMore) {
+                    // At the tail with more pending: fetch, then keep polling
+                    // briefly for the tail-fill so the player auto-advances
+                    // without user intervention.
+                    const idx = currentIndex;
                     await loadMore();
                     if (currentIndex < videos.length - 1) {
                         playVideo(currentIndex + 1);
+                        return;
+                    }
+                    const deadline = Date.now() + 30000;
+                    while (Date.now() < deadline) {
+                        if (!hasMore) break;
+                        if (videos.length - 1 > idx) break;
+                        await sleep(POLL_INTERVAL_MS);
+                        await loadMore();
+                    }
+                    if (currentIndex < videos.length - 1) {
+                        playVideo(currentIndex + 1);
+                    } else {
+                        // Still nothing: keep the tail sentinel visible.
+                        renderPlaylistPreserve();
+                        observeSentinel();
                     }
                 }
             }
@@ -637,21 +946,40 @@
                     btn.disabled = true;
                     playlist.innerHTML =
                         '<div class="loading">Refreshing…</div>';
+                    updateFreshBadge({ stale: true, loading: true, videos, fetchedAt: null });
                     try {
                         const data = await fetchVideosPage(
                             currentSub,
                             null,
                             true,
                         );
-                        videos = (data.videos || []).map(mapBackendVideo);
-                        afterCursor = data.after || null;
-                        hasMore = !!data.hasMore || !!data.loading;
-                        currentIndex = 0;
-                        renderPlaylist();
-                        observeSentinel();
-                        if (videos.length > 0) playVideo(0);
+                        const rows = data.videos || [];
+                        if (rows.length > 0) {
+                            videos = rows.map(mapBackendVideo);
+                            afterCursor = data.after || null;
+                            hasMore = !!data.hasMore || !!data.loading;
+                            currentIndex = 0;
+                            renderPlaylist();
+                            observeSentinel();
+                            playVideo(0);
+                            if (data.loading) {
+                                pollForHeadUpdate(currentSub, switchSeq);
+                            }
+                        } else if (data.loading) {
+                            await pollUntilNonEmpty(currentSub, switchSeq);
+                        } else {
+                            videos = [];
+                            afterCursor = data.after || null;
+                            hasMore = !!data.hasMore;
+                            currentIndex = 0;
+                            renderPlaylist();
+                            observeSentinel();
+                        }
                     } catch (error) {
                         console.error("Error refreshing:", error);
+                        if (error && error.status === 429 && error.retryAfterMs) {
+                            showRetryCountdown(error.retryAfterMs);
+                        }
                         playlist.innerHTML =
                             '<div class="loading">Error refreshing. Try again later.</div>';
                     } finally {

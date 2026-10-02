@@ -467,6 +467,71 @@ fn refresh_endpoint_offline_safe() {
     assert_eq!(r.status(), 400);
 }
 
+/// Polling contract for the sub-switch loading flow: the first GET returns
+/// instantly with a loading flag, and a second poll moments later keeps the
+/// same well-formed shape (200 with videos[]/after/hasMore/loading). Offline:
+/// the background fill fails without network, so rows stay empty but the
+/// shape must hold and both responses must be fast (never blocked on the
+/// 45s nav gate).
+#[test]
+fn videos_polling_keeps_shape_across_requests() {
+    let srv = TestServer::spawn();
+    let get = |url: String| -> (u16, serde_json::Value, Duration) {
+        let started = std::time::Instant::now();
+        let r = client().get(&url).send().unwrap();
+        let elapsed = started.elapsed();
+        let status = r.status().as_u16();
+        let body: serde_json::Value = r.json().unwrap();
+        (status, body, elapsed)
+    };
+    let url = format!("{}/api/videos?sub=videos&limit=5", srv.base);
+    let (s1, b1, e1) = get(url.clone());
+    assert!(
+        e1 < Duration::from_secs(20),
+        "first poll blocked {e1:?}: {b1}"
+    );
+    if s1 == 200 {
+        assert!(
+            b1.get("loading").and_then(|l| l.as_bool()).is_some(),
+            "first poll: loading must be bool, got {b1}"
+        );
+        // Second poll after the background job has had a moment: same shape.
+        std::thread::sleep(Duration::from_secs(2));
+        let (s2, b2, e2) = get(url);
+        assert!(
+            e2 < Duration::from_secs(20),
+            "second poll blocked {e2:?}: {b2}"
+        );
+        if s2 == 200 {
+            assert!(
+                b2.get("videos").and_then(|v| v.as_array()).is_some(),
+                "second poll: expected videos[] array, got {b2}"
+            );
+            assert!(
+                b2.get("loading").and_then(|l| l.as_bool()).is_some(),
+                "second poll: loading must be bool, got {b2}"
+            );
+            assert!(
+                b2.get("hasMore").and_then(|h| h.as_bool()).is_some(),
+                "second poll: hasMore must be bool, got {b2}"
+            );
+            if let Some(a) = b2.get("after") {
+                assert!(a.is_null() || a.is_string(), "after must be string|null, got {b2}");
+            }
+        } else {
+            assert!(
+                [429, 502].contains(&s2),
+                "expected 200 or 429/502, got {s2}: {b2}"
+            );
+        }
+    } else {
+        assert!(
+            [429, 502].contains(&s1),
+            "expected 200 instant slice or 429/502, got {s1}: {b1}"
+        );
+    }
+}
+
 /// Live check: hits real Reddit through the local server. Requires network.
 /// Non-blocking API: the first GET queues a background fetch and returns
 /// loading:true, so this polls until videos arrive (up to ~90s).

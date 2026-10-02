@@ -1232,15 +1232,20 @@ fn slice_body(
     let start = start.min(tl.posts.len());
     let end = (start + limit).min(tl.posts.len());
     let videos = &tl.posts[start..end];
-    let next_after = if end < tl.posts.len() {
-        Some(end.to_string())
-    } else {
-        None
-    };
     // Endless feed: more may exist on reddit even when the in-memory slice
     // is exhausted (reddit_after cursor) or a background job is running.
     let has_more =
         end < tl.posts.len() || tl.reddit_after.is_some() || tl.loading;
+    let next_after = if end < tl.posts.len() {
+        Some(end.to_string())
+    } else if has_more && !tl.posts.is_empty() {
+        // Tail slice but more may arrive (reddit_after cursor or background
+        // job pending): echo the tail index so the client can retry the same
+        // cursor instead of losing its position with after=null.
+        Some(end.to_string())
+    } else {
+        None
+    };
     let mut body = serde_json::json!({
         "sub": sub,
         "videos": videos,
@@ -1792,5 +1797,53 @@ mod unit_tests {
         assert_eq!(parse_after(&Some("25".to_string())), 25);
         // Legacy t3_* cursors restart at 0.
         assert_eq!(parse_after(&Some("t3_abc123".to_string())), 0);
+    }
+
+    fn tl_with(n: usize, loading: bool, reddit_after: Option<&str>) -> SubTimeline {
+        SubTimeline {
+            posts: (0..n)
+                .map(|i| VideoItem {
+                    youtube_id: format!("id{:011}", i),
+                    youtube_url: format!("https://www.youtube.com/watch?v=id{:011}", i),
+                    title: format!("title {}", i),
+                    reddit_url: format!("https://www.reddit.com/r/v/comments/c{}/x/", i),
+                    thumbnail: PLACEHOLDER_THUMB.to_string(),
+                    created_utc: None,
+                    reddit_id: Some(format!("t3_c{}", i)),
+                })
+                .collect(),
+            fetched_at_ms: Some(now_ms()),
+            last_error: None,
+            blocked_until_ms: None,
+            reddit_after: reddit_after.map(|s| s.to_string()),
+            loading,
+        }
+    }
+
+    #[test]
+    fn slice_body_echoes_tail_cursor_while_more_pending() {
+        // At the tail with a background job pending, the client must get a
+        // retryable cursor (not null) so it doesn't lose its position.
+        let tl = tl_with(10, true, None);
+        let body = slice_body("videos", &tl, 10, 25, true, None);
+        assert_eq!(body["after"].as_str(), Some("10"));
+        assert_eq!(body["hasMore"].as_bool(), Some(true));
+        assert_eq!(body["loading"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn slice_body_tail_cursor_null_when_truly_exhausted() {
+        let tl = tl_with(10, false, None);
+        let body = slice_body("videos", &tl, 10, 25, true, None);
+        assert!(body["after"].is_null(), "exhausted tail: {:?}", body["after"]);
+        assert_eq!(body["hasMore"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn slice_body_mid_page_cursor_advances() {
+        let tl = tl_with(10, false, None);
+        let body = slice_body("videos", &tl, 0, 5, true, None);
+        assert_eq!(body["after"].as_str(), Some("5"));
+        assert_eq!(body["videos"].as_array().unwrap().len(), 5);
     }
 }
