@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{MatchedPath, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -9,6 +9,8 @@ use chromiumoxide::{Browser, BrowserConfig};
 use dashmap::DashMap;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tower_http::trace::TraceLayer;
+use tracing::{debug, info, warn};
 use std::{
     collections::{HashSet, VecDeque},
     sync::{Arc, OnceLock},
@@ -537,6 +539,8 @@ async fn fetch_public_json(
     limit: u32,
     after: Option<&str>,
 ) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    let leg_start = Instant::now();
+    debug!(sub = %sub, leg = "public", "http leg start");
     let mut url = format!(
         "https://www.reddit.com/r/{}/new.json?limit={}&raw_json=1",
         sub, limit
@@ -553,6 +557,7 @@ async fn fetch_public_json(
         .send()
         .await
         .map_err(|e| {
+            debug!(sub = %sub, leg = "public", elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg transport error");
             (
                 StatusCode::BAD_GATEWAY,
                 format!("upstream request failed: {}", e),
@@ -562,6 +567,7 @@ async fn fetch_public_json(
     let status = resp.status();
     if status == StatusCode::TOO_MANY_REQUESTS {
         let ms = retry_after_ms(resp.headers());
+        debug!(sub = %sub, leg = "public", status = 429, elapsed_ms = leg_start.elapsed().as_millis() as u64, retry_after_ms = ?ms, "http leg rate-limited");
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "Reddit rate-limited the request".to_string(),
@@ -569,6 +575,7 @@ async fn fetch_public_json(
         ));
     }
     if status == StatusCode::FORBIDDEN {
+        debug!(sub = %sub, leg = "public", status = 403, elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg forbidden");
         return Err((
             StatusCode::BAD_GATEWAY,
             "Reddit denied the request (403)".to_string(),
@@ -576,6 +583,7 @@ async fn fetch_public_json(
         ));
     }
     if status.is_server_error() || status == StatusCode::UNAUTHORIZED {
+        debug!(sub = %sub, leg = "public", status = status.as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg upstream error");
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Reddit upstream returned {}", status.as_u16()),
@@ -583,6 +591,7 @@ async fn fetch_public_json(
         ));
     }
     if !status.is_success() {
+        debug!(sub = %sub, leg = "public", status = status.as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg unexpected status");
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Reddit upstream returned {}", status.as_u16()),
@@ -590,13 +599,16 @@ async fn fetch_public_json(
         ));
     }
     let listing: RedditListing = resp.json().await.map_err(|e| {
+        debug!(sub = %sub, leg = "public", elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg parse error");
         (
             StatusCode::BAD_GATEWAY,
             format!("failed to parse Reddit response: {}", e),
             None,
         )
     })?;
-    Ok(videos_from_listing(&listing))
+    let (videos, after) = videos_from_listing(&listing);
+    debug!(sub = %sub, leg = "public", status = 200, rows = videos.len(), has_after = after.is_some(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg end");
+    Ok((videos, after))
 }
 
 struct OauthCreds {
@@ -643,6 +655,8 @@ async fn fetch_oauth_json(
     after: Option<&str>,
 ) -> Option<Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)>> {
     let creds = oauth_creds()?;
+    let leg_start = Instant::now();
+    debug!(sub = %sub, leg = "oauth", "http leg start");
     // password grant
     let token_resp = client
         .post("https://www.reddit.com/api/v1/access_token")
@@ -657,12 +671,14 @@ async fn fetch_oauth_json(
         .await
         .ok()?;
     if !token_resp.status().is_success() {
+        debug!(sub = %sub, leg = "oauth", status = token_resp.status().as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth token rejected");
         return None;
     }
     let token: TokenResponse = token_resp.json().await.ok()?;
     let access = token.access_token?;
     let _ = token.token_type;
     if token.error.is_some() && access.is_empty() {
+        debug!(sub = %sub, leg = "oauth", elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth token error");
         return None;
     }
     let mut url = format!(
@@ -684,6 +700,7 @@ async fn fetch_oauth_json(
         .ok()?;
     if resp.status() == StatusCode::TOO_MANY_REQUESTS {
         let ms = retry_after_ms(resp.headers());
+        debug!(sub = %sub, leg = "oauth", status = 429, elapsed_ms = leg_start.elapsed().as_millis() as u64, retry_after_ms = ?ms, "http leg rate-limited");
         return Some(Err((
             StatusCode::TOO_MANY_REQUESTS,
             "Reddit (oauth) rate-limited the request".to_string(),
@@ -691,10 +708,13 @@ async fn fetch_oauth_json(
         )));
     }
     if !resp.status().is_success() {
+        debug!(sub = %sub, leg = "oauth", status = resp.status().as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth fetch non-success, falling through to RSS");
         return None; // let caller fall through to RSS
     }
     let listing: RedditListing = resp.json().await.ok()?;
-    Some(Ok(videos_from_listing(&listing)))
+    let (videos, after) = videos_from_listing(&listing);
+    debug!(sub = %sub, leg = "oauth", status = 200, rows = videos.len(), has_after = after.is_some(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg end");
+    Some(Ok((videos, after)))
 }
 
 async fn fetch_rss_fallback(
@@ -702,6 +722,8 @@ async fn fetch_rss_fallback(
     ua: &str,
     sub: &str,
 ) -> Result<Vec<VideoItem>, (StatusCode, String, Option<u64>)> {
+    let leg_start = Instant::now();
+    debug!(sub = %sub, leg = "rss", "http leg start");
     let url = format!("https://www.reddit.com/r/{}/new.rss", sub);
     let resp = client
         .get(&url)
@@ -710,6 +732,7 @@ async fn fetch_rss_fallback(
         .send()
         .await
         .map_err(|e| {
+            debug!(sub = %sub, leg = "rss", elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg transport error");
             (
                 StatusCode::BAD_GATEWAY,
                 format!("RSS fallback request failed: {}", e),
@@ -719,6 +742,7 @@ async fn fetch_rss_fallback(
     let status = resp.status();
     if status == StatusCode::TOO_MANY_REQUESTS {
         let ms = retry_after_ms(resp.headers());
+        debug!(sub = %sub, leg = "rss", status = 429, elapsed_ms = leg_start.elapsed().as_millis() as u64, retry_after_ms = ?ms, "http leg rate-limited");
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "Reddit rate-limited the request".to_string(),
@@ -726,6 +750,7 @@ async fn fetch_rss_fallback(
         ));
     }
     if status == StatusCode::FORBIDDEN {
+        debug!(sub = %sub, leg = "rss", status = 403, elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg forbidden");
         return Err((
             StatusCode::BAD_GATEWAY,
             "Reddit denied the request (403)".to_string(),
@@ -733,6 +758,7 @@ async fn fetch_rss_fallback(
         ));
     }
     if !status.is_success() {
+        debug!(sub = %sub, leg = "rss", status = status.as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg unexpected status");
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Reddit RSS upstream returned {}", status.as_u16()),
@@ -805,6 +831,7 @@ async fn fetch_rss_fallback(
             reddit_id,
         });
     }
+    debug!(sub = %sub, leg = "rss", status = 200, rows = out.len(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg end");
     Ok(out)
 }
 
@@ -819,8 +846,13 @@ async fn fetch_http_fallback(
     // Timeline fill always grabs the newest page; pagination is served
     // from memory via the index cursor.
     const FILL_LIMIT: u32 = 100;
+    let chain_start = Instant::now();
+    debug!(sub = %sub, chain = "fallback", has_after = after.is_some(), "http chain start");
     match fetch_public_json(client, &ua, sub, FILL_LIMIT, after).await {
-        Ok((videos, after)) => return Ok((dedupe_cap(videos), after)),
+        Ok((videos, after)) => {
+            debug!(sub = %sub, chain = "fallback", winner = "public", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+            return Ok((dedupe_cap(videos), after));
+        }
         Err((code, msg, retry_ms)) => {
             if code == StatusCode::TOO_MANY_REQUESTS {
                 return Err((code, msg, retry_ms));
@@ -832,7 +864,10 @@ async fn fetch_http_fallback(
                 fetch_oauth_json(client, &ua, sub, FILL_LIMIT, after).await
             {
                 match oauth_result {
-                    Ok((videos, after)) => return Ok((dedupe_cap(videos), after)),
+                    Ok((videos, after)) => {
+                        debug!(sub = %sub, chain = "fallback", winner = "oauth", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+                        return Ok((dedupe_cap(videos), after));
+                    }
                     Err((c2, m2, r2)) => {
                         if c2 == StatusCode::TOO_MANY_REQUESTS {
                             return Err((c2, m2, r2));
@@ -849,7 +884,10 @@ async fn fetch_http_fallback(
                 ));
             }
             match fetch_rss_fallback(client, &ua, sub).await {
-                Ok(all) => Ok((dedupe_cap(all), None)),
+                Ok(all) => {
+                    debug!(sub = %sub, chain = "fallback", winner = "rss", rows = all.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+                    Ok((dedupe_cap(all), None))
+                }
                 Err((c3, m3, r3)) => {
                     if c3 == StatusCode::TOO_MANY_REQUESTS {
                         return Err((c3, "Reddit rate-limited the request".to_string(), r3));
@@ -886,6 +924,8 @@ async fn fetch_http_first_paint(
 ) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
     let ua = reddit_ua();
     const FILL_LIMIT: u32 = 100;
+    let fp_start = Instant::now();
+    debug!(sub = %sub, chain = "first_paint", "http first-paint start (public+rss parallel)");
     let (pub_res, rss_res) = tokio::join!(
         tokio::time::timeout(
             FAST_HTTP_LEG_TIMEOUT,
@@ -899,6 +939,16 @@ async fn fetch_http_first_paint(
         Miss429(Option<u64>),
         Miss(String),
         Timeout,
+    }
+    impl<T> Leg<T> {
+        fn label(&self) -> &'static str {
+            match self {
+                Leg::Hit(_) => "hit",
+                Leg::Miss429(_) => "miss-429",
+                Leg::Miss(_) => "miss",
+                Leg::Timeout => "timeout",
+            }
+        }
     }
     let pub_leg: Leg<(Vec<VideoItem>, Option<String>)> = match pub_res {
         Err(_) => Leg::Timeout,
@@ -924,6 +974,7 @@ async fn fetch_http_first_paint(
     };
     match (pub_leg, rss_leg) {
         (Leg::Hit((pvideos, pafter)), Leg::Hit(rvideos)) => {
+            debug!(sub = %sub, chain = "first_paint", public_rows = pvideos.len(), rss_rows = rvideos.len(), elapsed_ms = fp_start.elapsed().as_millis() as u64, "http first-paint end (both legs hit)");
             if pvideos.is_empty() && rvideos.is_empty() {
                 Ok((Vec::new(), pafter))
             } else {
@@ -934,8 +985,14 @@ async fn fetch_http_first_paint(
                 Ok((dedupe_cap(merged), pafter))
             }
         }
-        (Leg::Hit((pvideos, pafter)), _) => Ok((dedupe_cap(pvideos), pafter)),
-        (_, Leg::Hit(rvideos)) => Ok((dedupe_cap(rvideos), None)),
+        (Leg::Hit((pvideos, pafter)), other) => {
+            debug!(sub = %sub, chain = "first_paint", winner = "public", rows = pvideos.len(), other = other.label(), elapsed_ms = fp_start.elapsed().as_millis() as u64, "http first-paint end");
+            Ok((dedupe_cap(pvideos), pafter))
+        }
+        (other, Leg::Hit(rvideos)) => {
+            debug!(sub = %sub, chain = "first_paint", winner = "rss", rows = rvideos.len(), other = other.label(), elapsed_ms = fp_start.elapsed().as_millis() as u64, "http first-paint end");
+            Ok((dedupe_cap(rvideos), None))
+        }
         (Leg::Miss429(r), Leg::Miss429(_)) => Err((
             StatusCode::TOO_MANY_REQUESTS,
             "Reddit rate-limited the request".to_string(),
@@ -980,6 +1037,8 @@ fn browser_cell() -> Arc<Mutex<Option<Browser>>> {
 }
 
 async fn launch_browser() -> Result<Browser, String> {
+    let launch_start = Instant::now();
+    debug!("browser launch start");
     let config = BrowserConfig::builder()
         .user_data_dir("./data/chrome-profile")
         .window_size(1920, 1080)
@@ -995,11 +1054,15 @@ async fn launch_browser() -> Result<Browser, String> {
         .map_err(|e| format!("browser config failed: {}", e))?;
     let (browser, mut handler) = Browser::launch(config)
         .await
-        .map_err(|e| format!("browser launch failed: {}", e))?;
+        .map_err(|e| {
+            debug!(elapsed_ms = launch_start.elapsed().as_millis() as u64, error = %e, "browser launch failed");
+            format!("browser launch failed: {}", e)
+        })?;
     // Drive the connection in the background.
     tokio::spawn(async move {
         while handler.next().await.is_some() {}
     });
+    debug!(elapsed_ms = launch_start.elapsed().as_millis() as u64, "browser launch end");
     Ok(browser)
 }
 
@@ -1072,18 +1135,34 @@ async fn scrape_old_reddit_url(
     url: &str,
     fast: bool,
 ) -> Result<(Vec<VideoItem>, Option<String>), String> {
+    let scrape_start = Instant::now();
+    debug!(url = %url, fast = fast, "browser nav start (goto)");
     let nav_timeout = if fast { FAST_NAV_TIMEOUT } else { Duration::from_secs(45) };
     match tokio::time::timeout(nav_timeout, page.goto(url)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(format!("navigation failed: {}", e)),
-        Err(_) => return Err("navigation timeout".to_string()),
+        Ok(Err(e)) => {
+            debug!(url = %url, elapsed_ms = scrape_start.elapsed().as_millis() as u64, error = %e, "browser nav failed");
+            return Err(format!("navigation failed: {}", e));
+        }
+        Err(_) => {
+            debug!(url = %url, elapsed_ms = scrape_start.elapsed().as_millis() as u64, "browser nav timeout");
+            return Err("navigation timeout".to_string());
+        }
     }
     // Wait for post content; a timeout here usually means a challenge/block.
     let sel_timeout = if fast { FAST_SELECTOR_TIMEOUT } else { Duration::from_secs(20) };
     match tokio::time::timeout(sel_timeout, page.find_element("a.title, shreddit-post")).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(format!("BLOCKED: selector not found: {}", e)),
-        Err(_) => return Err("BLOCKED: selector timeout (possible challenge)".to_string()),
+        Ok(Ok(_)) => {
+            debug!(url = %url, elapsed_ms = scrape_start.elapsed().as_millis() as u64, "browser selector found");
+        }
+        Ok(Err(e)) => {
+            debug!(url = %url, elapsed_ms = scrape_start.elapsed().as_millis() as u64, error = %e, "browser selector missing (BLOCKED?)");
+            return Err(format!("BLOCKED: selector not found: {}", e));
+        }
+        Err(_) => {
+            debug!(url = %url, elapsed_ms = scrape_start.elapsed().as_millis() as u64, "browser selector timeout (BLOCKED?)");
+            return Err("BLOCKED: selector timeout (possible challenge)".to_string());
+        }
     }
     if fast {
         tokio::time::sleep(FAST_DWELL).await;
@@ -1136,6 +1215,7 @@ async fn scrape_old_reddit_url(
         }
     }
     let after = after_from_next_href(scraped.next_href.as_deref());
+    debug!(url = %url, rows = out.len(), has_after = after.is_some(), elapsed_ms = scrape_start.elapsed().as_millis() as u64, "browser extract end");
     Ok((out, after))
 }
 
@@ -1154,13 +1234,17 @@ async fn scrape_sub_via_browser(
     fast: bool,
 ) -> Result<(Vec<VideoItem>, Option<String>), String> {
     if chrome_disabled() {
+        debug!(sub = %sub, "browser leg skipped (CHROME_DISABLED)");
         return Err("CHROME_DISABLED".to_string());
     }
+    let leg_start = Instant::now();
+    debug!(sub = %sub, fast = fast, "browser leg start");
     let cell = browser_cell();
     let mut guard = if fast {
         match tokio::time::timeout(FAST_BROWSER_LOCK_TIMEOUT, cell.lock()).await {
             Ok(g) => g,
             Err(_) => {
+                debug!(sub = %sub, elapsed_ms = leg_start.elapsed().as_millis() as u64, "browser leg skipped (BROWSER_BUSY)");
                 return Err(
                     "BROWSER_BUSY: browser contended, use HTTP fallback".to_string()
                 );
@@ -1172,14 +1256,20 @@ async fn scrape_sub_via_browser(
     if guard.is_none() {
         match launch_browser().await {
             Ok(b) => *guard = Some(b),
-            Err(e) => return Err(e),
+            Err(e) => {
+                debug!(sub = %sub, elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "browser leg launch failed");
+                return Err(e);
+            }
         }
     }
     let browser = guard.as_ref().expect("browser just launched");
     let page = browser
         .new_page("about:blank")
         .await
-        .map_err(|e| format!("new page failed: {}", e))?;
+        .map_err(|e| {
+            debug!(sub = %sub, elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "browser leg new_page failed");
+            format!("new page failed: {}", e)
+        })?;
     let result: Result<(Vec<VideoItem>, Option<String>), String> = async {
         page.enable_stealth_mode_with_agent(CHROME_UA)
             .await
@@ -1219,6 +1309,10 @@ async fn scrape_sub_via_browser(
     }
     .await;
     let _ = page.close().await;
+    match &result {
+        Ok((rows, after)) => debug!(sub = %sub, fast = fast, rows = rows.len(), has_after = after.is_some(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "browser leg end (ok)"),
+        Err(e) => debug!(sub = %sub, fast = fast, elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "browser leg end (err)"),
+    }
     result
 }
 
@@ -1398,7 +1492,10 @@ async fn store_head_fill(
     posts: Vec<VideoItem>,
     reddit_after: Option<String>,
 ) {
+    let rows = posts.len();
+    let incoming_after = reddit_after.clone();
     let mut w = tl.write().await;
+    let prev_after = w.reddit_after.clone();
     w.posts = dedupe_cap(posts);
     if reddit_after.is_some() {
         w.reddit_after = reddit_after;
@@ -1407,6 +1504,14 @@ async fn store_head_fill(
     w.last_error = None;
     w.blocked_until_ms = None;
     w.loading = false;
+    let kept = incoming_after.is_none() && prev_after.is_some();
+    info!(
+        rows = rows,
+        cursor_updated = incoming_after.is_some(),
+        cursor_kept = kept,
+        has_after = w.reddit_after.is_some(),
+        "store_head_fill"
+    );
 }
 
 /// Merge a refreshed newest page at the head (unseen newer first).
@@ -1415,8 +1520,13 @@ async fn apply_head_merge(
     fresh_page: Vec<VideoItem>,
     reddit_after: Option<String>,
 ) {
+    let incoming_rows = fresh_page.len();
+    let incoming_after = reddit_after.clone();
     let mut w = tl.write().await;
+    let before = w.posts.len();
+    let prev_after = w.reddit_after.clone();
     let merged = merge_newest_head(std::mem::take(&mut w.posts), fresh_page);
+    let added = merged.len().saturating_sub(before.min(merged.len()));
     w.posts = merged;
     if reddit_after.is_some() {
         w.reddit_after = reddit_after;
@@ -1425,6 +1535,15 @@ async fn apply_head_merge(
     w.last_error = None;
     w.blocked_until_ms = None;
     w.loading = false;
+    let kept = incoming_after.is_none() && prev_after.is_some();
+    info!(
+        incoming_rows = incoming_rows,
+        unseen_added = added,
+        total = w.posts.len(),
+        cursor_updated = incoming_after.is_some(),
+        cursor_kept = kept,
+        "apply_head_merge"
+    );
 }
 
 /// Merge an older next-page at the tail: only unseen older items appended.
@@ -1434,12 +1553,22 @@ async fn apply_tail_merge(
     next_page: Vec<VideoItem>,
     next_after: Option<String>,
 ) {
+    let incoming_rows = next_page.len();
     let mut w = tl.write().await;
+    let before = w.posts.len();
     let merged = merge_older_tail(std::mem::take(&mut w.posts), next_page);
+    let appended = merged.len().saturating_sub(before);
     w.posts = merged;
-    w.reddit_after = next_after;
+    w.reddit_after = next_after.clone();
     w.last_error = None;
     w.loading = false;
+    info!(
+        incoming_rows = incoming_rows,
+        appended = appended,
+        total = w.posts.len(),
+        has_next_after = next_after.is_some(),
+        "apply_tail_merge"
+    );
 }
 
 async fn set_loading(tl: &Arc<RwLock<SubTimeline>>, loading: bool) {
@@ -1460,13 +1589,19 @@ async fn mark_blocked(tl: &Arc<RwLock<SubTimeline>>, reason: String) {
     };
     w.blocked_until_ms = Some(now_ms() + backoff);
     w.loading = false;
-    let _ = reason;
+    warn!(
+        backoff_ms = backoff,
+        empty_timeline = w.posts.is_empty(),
+        reason = %reason,
+        "mark_blocked: sub backed off after block/challenge"
+    );
 }
 
 async fn finish_with_error(tl: &Arc<RwLock<SubTimeline>>, code: StatusCode, msg: String) {
     let mut w = tl.write().await;
     if code == StatusCode::TOO_MANY_REQUESTS {
         w.last_error = Some("UPSTREAM_429".to_string());
+        warn!(status = 429, "fetch ended rate-limited (UPSTREAM_429)");
     } else if msg.contains("403") || msg.contains("BLOCKED") {
         w.last_error = Some("BLOCKED".to_string());
         // Single-leg transient 403 on an empty timeline: short backoff so
@@ -1477,7 +1612,9 @@ async fn finish_with_error(tl: &Arc<RwLock<SubTimeline>>, code: StatusCode, msg:
             BLOCKED_BACKOFF_MS
         };
         w.blocked_until_ms = Some(now_ms() + backoff);
+        warn!(backoff_ms = backoff, empty_timeline = w.posts.is_empty(), error = %msg, "fetch ended blocked");
     } else {
+        debug!(status = code.as_u16(), error = %msg, "fetch ended with error");
         w.last_error = Some(msg);
     }
     w.loading = false;
@@ -1504,11 +1641,14 @@ async fn gate_retry_hint(state: &AppState) -> Option<u64> {
 /// unseen rows if it arrives later. BROWSER_BUSY / gate exhaustion just
 /// means the HTTP legs decide alone.
 async fn background_head_refresh(state: AppState, sub: String) {
+    let job_start = Instant::now();
     let tl = timeline_arc(&state, &sub);
     {
         let r = tl.read().await;
         if let Some(until) = r.blocked_until_ms {
             if now_ms() < until {
+                let retry_ms = (until - now_ms()).max(0) as u64;
+                debug!(sub = %sub, retry_after_ms = retry_ms, "head_refresh skip (backoff active)");
                 set_loading(&tl, false).await;
                 return;
             }
@@ -1516,10 +1656,12 @@ async fn background_head_refresh(state: AppState, sub: String) {
     }
     let lock = inflight_lock(&state, &sub);
     let Ok(_guard) = lock.try_lock() else {
+        info!(sub = %sub, "head_refresh coalesced (single-flight already running)");
         return;
     };
     set_loading(&tl, true).await;
     let first_paint = tl.read().await.posts.is_empty();
+    info!(sub = %sub, first_paint = first_paint, "head_refresh start");
     // Chrome-disabled (CI/tests): HTTP-only head fill, no race needed.
     // First paint uses the fast parallel legs (public+RSS ~4s each, OAuth
     // skipped); enrichment keeps the full sequential chain + OAuth.
@@ -1531,30 +1673,40 @@ async fn background_head_refresh(state: AppState, sub: String) {
         };
         match res {
             Ok((posts, after)) => {
+                let rows = posts.len();
+                let has_after = after.is_some();
                 if first_paint {
                     store_head_fill(&tl, posts, after).await;
                 } else {
                     apply_head_merge(&tl, posts, after).await;
                 }
+                info!(sub = %sub, first_paint = first_paint, winner = "http(chrome-disabled)", rows = rows, has_after = has_after, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (filled)");
             }
-            Err((code, msg, _)) => finish_with_error(&tl, code, msg).await,
+            Err((code, msg, _)) => {
+                info!(sub = %sub, first_paint = first_paint, status = code.as_u16(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (error)");
+                finish_with_error(&tl, code, msg).await;
+            }
         }
         return;
     }
-    let gate_ok = {
+    let gate_reserve: Result<(), u64> = {
         let mut gate = state.nav_gate.lock().await;
         // Priority lane: a never-fetched sub bypasses the 45s+jitter +
         // hourly cap and only respects the short overlap guard so the
         // first paint fetches then and there.
         if first_paint {
-            nav_gate_reserve_priority(&mut gate).is_ok()
+            nav_gate_reserve_priority(&mut gate)
         } else {
-            nav_gate_reserve(&mut gate).is_ok()
+            nav_gate_reserve(&mut gate)
         }
     };
+    let gate_ok = gate_reserve.is_ok();
     if !gate_ok {
         // Gate exhausted: HTTP needs no nav slot, so it still makes progress.
         // Fast legs on first paint; full chain for enrichment.
+        if let Err(retry_ms) = gate_reserve {
+            info!(sub = %sub, first_paint = first_paint, retry_after_ms = retry_ms, "nav_gate reserve miss (http-only fallback)");
+        }
         let res = if first_paint {
             fetch_http_first_paint(&state.client, &sub).await
         } else {
@@ -1562,16 +1714,23 @@ async fn background_head_refresh(state: AppState, sub: String) {
         };
         match res {
             Ok((posts, after)) => {
+                let rows = posts.len();
+                let has_after = after.is_some();
                 if first_paint {
                     store_head_fill(&tl, posts, after).await;
                 } else {
                     apply_head_merge(&tl, posts, after).await;
                 }
+                info!(sub = %sub, first_paint = first_paint, winner = "http(gate-miss)", rows = rows, has_after = has_after, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (filled)");
             }
-            Err((code, msg, _)) => finish_with_error(&tl, code, msg).await,
+            Err((code, msg, _)) => {
+                info!(sub = %sub, first_paint = first_paint, status = code.as_u16(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (error)");
+                finish_with_error(&tl, code, msg).await;
+            }
         }
         return;
     }
+    debug!(sub = %sub, first_paint = first_paint, lane = if first_paint { "priority" } else { "normal" }, "nav_gate reserve hit");
     // Politeness: the nav slot above covers the browser leg. Race both legs
     // concurrently so HTTP first paint never waits out the ~7s+7s+2s
     // browser budget. First paint: fast parallel HTTP legs (public+RSS ~4s
@@ -1608,6 +1767,7 @@ async fn background_head_refresh(state: AppState, sub: String) {
     // (first_paint only applies to the very first store; the loser always
     // head-merges so playback order is preserved.)
     let mut stored = false;
+    let mut winner_leg: Option<&str> = None;
     let mut browser_err: Option<String> = None;
     let mut http_err: Option<(StatusCode, String, Option<u64>)> = None;
     // Deferred loser results, awaited after the first store.
@@ -1637,7 +1797,9 @@ async fn background_head_refresh(state: AppState, sub: String) {
     match first {
         First::Browser(Ok(Ok((posts, after)))) => {
             pending_http = Some(http_handle);
+            debug!(sub = %sub, leg = "browser", rows = posts.len(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh first leg arrived (browser)");
             if !posts.is_empty() {
+                winner_leg = Some("browser");
                 store_posts(&tl, first_paint, posts, after, &mut stored).await;
             } else {
                 // Empty fast leg: don't store yet; the HTTP leg decides.
@@ -1647,6 +1809,7 @@ async fn background_head_refresh(state: AppState, sub: String) {
         }
         First::Browser(Ok(Err(e))) => {
             pending_http = Some(http_handle);
+            debug!(sub = %sub, leg = "browser", elapsed_ms = job_start.elapsed().as_millis() as u64, error = %e, "head_refresh first leg failed (browser)");
             if e.contains("BLOCKED") {
                 browser_err = Some(e);
             } else if e != "CHROME_DISABLED" && !e.contains("BROWSER_BUSY") {
@@ -1657,12 +1820,15 @@ async fn background_head_refresh(state: AppState, sub: String) {
         }
         First::Browser(Err(join_err)) => {
             pending_http = Some(http_handle);
+            debug!(sub = %sub, leg = "browser", elapsed_ms = job_start.elapsed().as_millis() as u64, error = %join_err, "head_refresh browser task panicked");
             let mut w = tl.write().await;
             w.last_error = Some(format!("browser task failed: {}", join_err));
         }
         First::Http(Ok(Ok((posts, after)))) => {
             pending_browser = Some(browser_handle);
+            debug!(sub = %sub, leg = "http", rows = posts.len(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh first leg arrived (http)");
             if !posts.is_empty() {
+                winner_leg = Some("http");
                 store_posts(&tl, first_paint, posts, after, &mut stored).await;
             } else if first_paint {
                 // HTTP head is empty: still store it so loading clears and
@@ -1677,10 +1843,12 @@ async fn background_head_refresh(state: AppState, sub: String) {
         }
         First::Http(Ok(Err(e))) => {
             pending_browser = Some(browser_handle);
+            debug!(sub = %sub, leg = "http", elapsed_ms = job_start.elapsed().as_millis() as u64, error = %e.1, "head_refresh first leg failed (http)");
             http_err = Some(e);
         }
         First::Http(Err(join_err)) => {
             pending_browser = Some(browser_handle);
+            debug!(sub = %sub, leg = "http", elapsed_ms = job_start.elapsed().as_millis() as u64, error = %join_err, "head_refresh http task panicked");
             http_err = Some((
                 StatusCode::BAD_GATEWAY,
                 format!("http task failed: {}", join_err),
@@ -1695,7 +1863,11 @@ async fn background_head_refresh(state: AppState, sub: String) {
     if let Some(handle) = pending_http {
         match handle.await {
             Ok(Ok((posts, after))) => {
+                debug!(sub = %sub, leg = "http", rows = posts.len(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh loser arrived (http)");
                 if !posts.is_empty() {
+                    if winner_leg.is_none() {
+                        winner_leg = Some("http(loser)");
+                    }
                     store_posts(&tl, first_paint && !stored, posts, after, &mut stored)
                         .await;
                 } else if !stored {
@@ -1723,7 +1895,11 @@ async fn background_head_refresh(state: AppState, sub: String) {
     } else if let Some(handle) = pending_browser {
         match handle.await {
             Ok(Ok((posts, after))) => {
+                debug!(sub = %sub, leg = "browser", rows = posts.len(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh loser arrived (browser)");
                 if !posts.is_empty() {
+                    if winner_leg.is_none() {
+                        winner_leg = Some("browser(loser)");
+                    }
                     store_posts(&tl, first_paint && !stored, posts, after, &mut stored)
                         .await;
                 }
@@ -1762,6 +1938,8 @@ async fn background_head_refresh(state: AppState, sub: String) {
     }
 
     if stored {
+        let r = tl.read().await;
+        info!(sub = %sub, first_paint = first_paint, winner = winner_leg.unwrap_or("empty"), rows = r.posts.len(), has_after = r.reddit_after.is_some(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (filled)");
         return;
     }
     // Neither leg produced rows: surface block/rate-limit state. A single
@@ -1779,12 +1957,14 @@ async fn background_head_refresh(state: AppState, sub: String) {
     if browser_blocked && http_blocked {
         // Confirmed block on both legs: escalate to backoff.
         if let Some(e) = browser_err {
+            info!(sub = %sub, first_paint = first_paint, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (blocked, both legs)");
             mark_blocked(&tl, e).await;
             return;
         }
     } else if browser_blocked {
         // Single-leg browser BLOCKED with a non-block HTTP failure:
         // record it without a 3h blackout so the next poll retries soon.
+        info!(sub = %sub, first_paint = first_paint, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (browser blocked, http failed differently)");
         if let Some((code, msg, _)) = http_err {
             finish_with_error(&tl, code, msg).await;
         } else {
@@ -1795,8 +1975,10 @@ async fn background_head_refresh(state: AppState, sub: String) {
         return;
     }
     if let Some((code, msg, _)) = http_err {
+        info!(sub = %sub, first_paint = first_paint, status = code.as_u16(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (error)");
         finish_with_error(&tl, code, msg).await;
     } else {
+        info!(sub = %sub, first_paint = first_paint, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (empty, no rows)");
         set_loading(&tl, false).await;
     }
 }
@@ -1812,11 +1994,13 @@ async fn background_head_refresh(state: AppState, sub: String) {
 /// per-sub lock, so focus changes need no abort — the old sub's paginate
 /// just tail-merges whenever its HTTP fetch lands.
 async fn background_paginate(state: AppState, sub: String) {
+    let job_start = Instant::now();
     let tl = timeline_arc(&state, &sub);
     {
         let r = tl.read().await;
         if let Some(until) = r.blocked_until_ms {
             if now_ms() < until {
+                debug!(sub = %sub, "paginate skip (backoff active)");
                 return;
             }
         }
@@ -1825,17 +2009,30 @@ async fn background_paginate(state: AppState, sub: String) {
         let r = tl.read().await;
         match r.reddit_after.clone() {
             Some(c) => c,
-            None => return, // nothing older known; head refresh covers it
+            None => {
+                debug!(sub = %sub, "paginate skip (no cursor)");
+                return; // nothing older known; head refresh covers it
+            }
         }
     };
     let lock = paginate_lock(&state, &sub);
     let Ok(_guard) = lock.try_lock() else {
+        info!(sub = %sub, after = %cursor, "paginate coalesced (single-flight already running)");
         return;
     };
     set_loading(&tl, true).await;
+    info!(sub = %sub, after = %cursor, "paginate start");
     match fetch_http_fallback(&state.client, &sub, Some(&cursor)).await {
-        Ok((posts, next_after)) => apply_tail_merge(&tl, posts, next_after).await,
-        Err((code, msg, _)) => finish_with_error(&tl, code, msg).await,
+        Ok((posts, next_after)) => {
+            let rows = posts.len();
+            let has_next = next_after.is_some();
+            apply_tail_merge(&tl, posts, next_after).await;
+            info!(sub = %sub, after = %cursor, rows = rows, has_next_after = has_next, elapsed_ms = job_start.elapsed().as_millis() as u64, "paginate end (appended)");
+        }
+        Err((code, msg, _)) => {
+            info!(sub = %sub, after = %cursor, status = code.as_u16(), elapsed_ms = job_start.elapsed().as_millis() as u64, "paginate end (error)");
+            finish_with_error(&tl, code, msg).await;
+        }
     }
 }
 
@@ -1853,8 +2050,10 @@ async fn videos_handler(
     State(state): State<AppState>,
     Query(q): Query<VideosQuery>,
 ) -> Response {
+    let req_start = Instant::now();
     let sub = q.sub.unwrap_or_else(|| "videos".to_string());
     if !is_valid_sub(&sub) {
+        info!(method = "GET", route = "/api/videos", sub = %sub, status = 400, elapsed_ms = req_start.elapsed().as_millis() as u64, "request (BAD_SUB)");
         return error_json(
             StatusCode::BAD_REQUEST,
             "BAD_SUB",
@@ -1867,6 +2066,7 @@ async fn videos_handler(
         Some(s) => match s.parse::<i64>() {
             Ok(n) if (1..=100).contains(&n) => n as u32,
             _ => {
+                info!(method = "GET", route = "/api/videos", sub = %sub, status = 400, elapsed_ms = req_start.elapsed().as_millis() as u64, "request (BAD_LIMIT)");
                 return error_json(
                     StatusCode::BAD_REQUEST,
                     "BAD_LIMIT",
@@ -1892,6 +2092,7 @@ async fn videos_handler(
                 let now = now_ms();
                 if now < until {
                     let retry_ms = (until - now).max(0) as u64;
+                    info!(method = "GET", route = "/api/videos", sub = %sub, limit = limit, refresh = refresh_req, status = 502, served_from = "empty-loading", retry_after_ms = retry_ms, elapsed_ms = req_start.elapsed().as_millis() as u64, "request (UPSTREAM_BLOCKED backoff)");
                     return error_json(
                         StatusCode::BAD_GATEWAY,
                         "UPSTREAM_BLOCKED",
@@ -1935,6 +2136,7 @@ async fn videos_handler(
     // prefetch older pages when within 5 items of the tail, otherwise queue
     // a head refresh when stale/missing/forced. The 45s MIN_NAV_GAP never
     // blocks: it surfaces as a retryAfterMs hint with loading:true.
+    #[derive(Clone, Copy)]
     enum Job {
         Paginate,
         Head,
@@ -2000,6 +2202,38 @@ async fn videos_handler(
             body["loading"] = serde_json::Value::Bool(true);
         }
     }
+    let videos_count = body["videos"].as_array().map(|a| a.len()).unwrap_or(0);
+    let loading = body["loading"].as_bool().unwrap_or(false);
+    let has_more = body["hasMore"].as_bool().unwrap_or(false);
+    let served_from = if never_fetched {
+        "empty-loading"
+    } else if is_stale || refresh_req {
+        "stale"
+    } else {
+        "fresh-cache"
+    };
+    let job_label = match job {
+        Job::Paginate => "paginate",
+        Job::Head => "head",
+        Job::None => "none",
+    };
+    info!(
+        method = "GET",
+        route = "/api/videos",
+        sub = %sub,
+        limit = limit,
+        after = ?after,
+        refresh = refresh_req,
+        status = 200,
+        served_from = served_from,
+        videos = videos_count,
+        loading = loading,
+        has_more = has_more,
+        job = job_label,
+        retry_after_ms = ?retry_hint,
+        elapsed_ms = req_start.elapsed().as_millis() as u64,
+        "request"
+    );
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -2007,8 +2241,10 @@ async fn refresh_handler(
     State(state): State<AppState>,
     Query(q): Query<RefreshQuery>,
 ) -> Response {
+    let req_start = Instant::now();
     let sub = q.sub.unwrap_or_else(|| "videos".to_string());
     if !is_valid_sub(&sub) {
+        info!(method = "POST", route = "/api/refresh", sub = %sub, status = 400, elapsed_ms = req_start.elapsed().as_millis() as u64, "request (BAD_SUB)");
         return error_json(
             StatusCode::BAD_REQUEST,
             "BAD_SUB",
@@ -2025,6 +2261,7 @@ async fn refresh_handler(
     {
         let lock = inflight_lock(&state, &sub);
         if lock.try_lock().is_err() {
+            info!(method = "POST", route = "/api/refresh", sub = %sub, status = 429, served_from = "coalesced", elapsed_ms = req_start.elapsed().as_millis() as u64, "request (single-flight coalesced)");
             return error_json(
                 StatusCode::TOO_MANY_REQUESTS,
                 "RATE_LIMITED",
@@ -2035,6 +2272,7 @@ async fn refresh_handler(
         if !never_fetched {
             let mut gate = state.nav_gate.lock().await;
             if let Err(retry_ms) = nav_gate_peek(&mut gate) {
+                info!(method = "POST", route = "/api/refresh", sub = %sub, status = 429, retry_after_ms = retry_ms, elapsed_ms = req_start.elapsed().as_millis() as u64, "request (nav-gate peek miss)");
                 return error_json(
                     StatusCode::TOO_MANY_REQUESTS,
                     "RATE_LIMITED",
@@ -2067,11 +2305,24 @@ async fn refresh_handler(
         "stale": true,
         "loading": true,
     });
+    info!(method = "POST", route = "/api/refresh", sub = %sub, status = 200, served_from = "queued-refresh", elapsed_ms = req_start.elapsed().as_millis() as u64, "request (refresh queued)");
     (StatusCode::OK, Json(body)).into_response()
 }
 
 #[tokio::main]
 async fn main() {
+    // Human-readable stdout logs with timestamps. RUST_LOG controls levels,
+    // defaulting to info (requests + scrape start/end + fills/blocks);
+    // per-leg details (public/RSS/OAuth/browser nav/extract) are debug.
+    // Example: `RUST_LOG=debug cargo run` to watch scrapes live.
+    tracing_subscriber::fmt()
+        .compact()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "reddittv=info,tower_http=info".into()),
+        )
+        .init();
+
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2094,7 +2345,23 @@ async fn main() {
         .route("/healthz", get(healthz))
         .route("/api/subs", get(subs))
         .route("/api/videos", get(videos_handler))
-        .route("/api/refresh", post(refresh_handler));
+        .route("/api/refresh", post(refresh_handler))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(
+                |request: &axum::http::Request<_>| {
+                    let matched = request
+                        .extensions()
+                        .get::<MatchedPath>()
+                        .map(MatchedPath::as_str)
+                        .unwrap_or_else(|| request.uri().path());
+                    tracing::info_span!(
+                        "request",
+                        method = %request.method(),
+                        route = %matched,
+                    )
+                },
+            ),
+        );
 
     // Static files with index fallback for SPA-ish root.
     let serve_dir = ServeDir::new("static")
@@ -2107,7 +2374,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind");
-    println!("reddittv listening on http://{}", addr);
+    info!("reddittv listening on http://{}", addr);
     axum::serve(listener, app).await.expect("server error");
 }
 
