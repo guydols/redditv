@@ -54,9 +54,13 @@ const PRIORITY_NAV_GAP: Duration = Duration::from_secs(6);
 /// Fast-path caps so a sub switch never blocks on the browser: first paint
 /// uses short navigation/selector timeouts and a ~2s dwell. Longer dwells
 /// are reserved for background pagination jobs.
-const FAST_NAV_TIMEOUT: Duration = Duration::from_secs(12);
-const FAST_SELECTOR_TIMEOUT: Duration = Duration::from_secs(12);
+const FAST_NAV_TIMEOUT: Duration = Duration::from_secs(7);
+const FAST_SELECTOR_TIMEOUT: Duration = Duration::from_secs(7);
 const FAST_DWELL: Duration = Duration::from_secs(2);
+/// Fast path never queues behind a busy browser: if the shared browser cell
+/// is contended longer than this, skip straight to HTTP (browser stays
+/// reserved for background enrichment only).
+const FAST_BROWSER_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 /// When a slice ends within this many items of the tail, serve it now and
 /// prefetch the next reddit page in the background.
 const PREFETCH_TAIL_THRESHOLD: usize = 5;
@@ -1035,9 +1039,11 @@ async fn scrape_old_reddit_url(
 /// Returns Err with "BLOCKED: ..." prefix when a selector timeout or
 /// challenge page suggests bot detection.
 ///
-/// Fast path (`fast=true`) caps navigation/selector waits (~12s) and the
-/// dwell (~2s) so sub switches stay instant; background pagination uses
-/// the longer dwell.
+/// Fast path (`fast=true`) caps navigation/selector waits (~7s) and the
+/// dwell (~2s) so sub switches stay instant; it also never queues behind a
+/// busy browser — if the cell is contended past FAST_BROWSER_LOCK_TIMEOUT
+/// it fails fast with BROWSER_BUSY so the caller falls through to HTTP.
+/// Background pagination never takes this lock (HTTP-only).
 async fn scrape_sub_via_browser(
     sub: &str,
     fast: bool,
@@ -1046,7 +1052,18 @@ async fn scrape_sub_via_browser(
         return Err("CHROME_DISABLED".to_string());
     }
     let cell = browser_cell();
-    let mut guard = cell.lock().await;
+    let mut guard = if fast {
+        match tokio::time::timeout(FAST_BROWSER_LOCK_TIMEOUT, cell.lock()).await {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(
+                    "BROWSER_BUSY: browser contended, use HTTP fallback".to_string()
+                );
+            }
+        }
+    } else {
+        cell.lock().await
+    };
     if guard.is_none() {
         match launch_browser().await {
             Ok(b) => *guard = Some(b),
@@ -1094,45 +1111,6 @@ async fn scrape_sub_via_browser(
                 .await
             }
         }
-    }
-    .await;
-    let _ = page.close().await;
-    result
-}
-
-/// Scrape the next older page for endless pagination:
-/// `https://old.reddit.com/r/{sub}/new/?count={count}&after={after}`.
-/// Uses the longer background dwell (never on the fast switch path).
-async fn scrape_next_page_via_browser(
-    sub: &str,
-    after: &str,
-    count: usize,
-) -> Result<(Vec<VideoItem>, Option<String>), String> {
-    if chrome_disabled() {
-        return Err("CHROME_DISABLED".to_string());
-    }
-    let cell = browser_cell();
-    let mut guard = cell.lock().await;
-    if guard.is_none() {
-        match launch_browser().await {
-            Ok(b) => *guard = Some(b),
-            Err(e) => return Err(e),
-        }
-    }
-    let browser = guard.as_ref().expect("browser just launched");
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .map_err(|e| format!("new page failed: {}", e))?;
-    let result = async {
-        page.enable_stealth_mode_with_agent(CHROME_UA)
-            .await
-            .map_err(|e| format!("stealth mode failed: {}", e))?;
-        let url = format!(
-            "https://old.reddit.com/r/{}/new/?count={}&after={}",
-            sub, count, after
-        );
-        scrape_old_reddit_url(&page, &url, false).await
     }
     .await;
     let _ = page.close().await;
@@ -1381,9 +1359,14 @@ async fn gate_retry_hint(state: &AppState) -> Option<u64> {
 }
 
 /// Background head refresh: re-fetch the newest page and head-merge it.
-/// Never blocks a response; updates the timeline in place. The browser
-/// attempt reserves a nav slot; on gate exhaustion it falls through to the
-/// reqwest chain (which needs no navigation) so switches still make progress.
+/// Never blocks a response; updates the timeline in place.
+///
+/// Race, don't sequence: the browser leg (fast ~7s caps, nav slot
+/// reserved, 1s lock timeout so it never queues behind a busy browser)
+/// runs concurrently with the reqwest chain (needs no navigation).
+/// The first leg with rows>0 does the head fill; the loser head-merges
+/// unseen rows if it arrives later. BROWSER_BUSY / gate exhaustion just
+/// means the HTTP leg decides alone.
 async fn background_head_refresh(state: AppState, sub: String) {
     let tl = timeline_arc(&state, &sub);
     {
@@ -1401,57 +1384,255 @@ async fn background_head_refresh(state: AppState, sub: String) {
     };
     set_loading(&tl, true).await;
     let first_paint = tl.read().await.posts.is_empty();
-    if !chrome_disabled() {
-        let gate_ok = {
-            let mut gate = state.nav_gate.lock().await;
-            // Priority lane: a never-fetched sub bypasses the 45s+jitter +
-            // hourly cap and only respects the short overlap guard so the
-            // first paint fetches then and there.
-            if first_paint {
-                nav_gate_reserve_priority(&mut gate).is_ok()
-            } else {
-                nav_gate_reserve(&mut gate).is_ok()
+    // Chrome-disabled (CI/tests): HTTP-only head fill, no race needed.
+    if chrome_disabled() {
+        match fetch_http_fallback(&state.client, &sub, None).await {
+            Ok((posts, after)) => {
+                if first_paint {
+                    store_head_fill(&tl, posts, after).await;
+                } else {
+                    apply_head_merge(&tl, posts, after).await;
+                }
             }
-        };
-        if gate_ok {
-            match scrape_sub_via_browser(&sub, true).await {
-                Ok((posts, after)) => {
-                    if first_paint {
-                        store_head_fill(&tl, posts, after).await;
-                    } else {
-                        apply_head_merge(&tl, dedupe_cap(posts), after).await;
-                    }
-                    return;
+            Err((code, msg, _)) => finish_with_error(&tl, code, msg).await,
+        }
+        return;
+    }
+    let gate_ok = {
+        let mut gate = state.nav_gate.lock().await;
+        // Priority lane: a never-fetched sub bypasses the 45s+jitter +
+        // hourly cap and only respects the short overlap guard so the
+        // first paint fetches then and there.
+        if first_paint {
+            nav_gate_reserve_priority(&mut gate).is_ok()
+        } else {
+            nav_gate_reserve(&mut gate).is_ok()
+        }
+    };
+    if !gate_ok {
+        // Gate exhausted: HTTP needs no nav slot, so it still makes progress.
+        match fetch_http_fallback(&state.client, &sub, None).await {
+            Ok((posts, after)) => {
+                if first_paint {
+                    store_head_fill(&tl, posts, after).await;
+                } else {
+                    apply_head_merge(&tl, posts, after).await;
                 }
-                Err(e) => {
-                    if e.contains("BLOCKED") {
-                        mark_blocked(&tl, e).await;
-                        return;
-                    }
-                    if e != "CHROME_DISABLED" {
-                        let mut w = tl.write().await;
-                        w.last_error = Some(e);
-                    }
-                }
+            }
+            Err((code, msg, _)) => finish_with_error(&tl, code, msg).await,
+        }
+        return;
+    }
+    // Politeness: the nav slot above covers the browser leg. Race both legs
+    // concurrently so HTTP first paint never waits out the ~7s+7s+2s
+    // browser budget.
+    let http_client = state.client.clone();
+    let sub_http = sub.clone();
+    let sub_browser = sub.clone();
+    let mut browser_handle =
+        tokio::spawn(async move { scrape_sub_via_browser(&sub_browser, true).await });
+    let mut http_handle =
+        tokio::spawn(
+            async move { fetch_http_fallback(&http_client, &sub_http, None).await },
+        );
+
+    type BrowserOut = Result<(Vec<VideoItem>, Option<String>), String>;
+    type HttpOut = Result<
+        (Vec<VideoItem>, Option<String>),
+        (StatusCode, String, Option<u64>),
+    >;
+    enum First {
+        Browser(Result<BrowserOut, tokio::task::JoinError>),
+        Http(Result<HttpOut, tokio::task::JoinError>),
+    }
+    let first = tokio::select! {
+        b = &mut browser_handle => First::Browser(b),
+        h = &mut http_handle => First::Http(h),
+    };
+    // Store the first leg with rows>0; remember the other leg to merge.
+    // (first_paint only applies to the very first store; the loser always
+    // head-merges so playback order is preserved.)
+    let mut stored = false;
+    let mut browser_err: Option<String> = None;
+    let mut http_err: Option<(StatusCode, String, Option<u64>)> = None;
+    // Deferred loser results, awaited after the first store.
+    let mut pending_browser: Option<
+        tokio::task::JoinHandle<BrowserOut>,
+    > = None;
+    let mut pending_http: Option<tokio::task::JoinHandle<HttpOut>> = None;
+
+    async fn store_posts(
+        tl: &Arc<RwLock<SubTimeline>>,
+        first_paint: bool,
+        posts: Vec<VideoItem>,
+        after: Option<String>,
+        stored: &mut bool,
+    ) {
+        if *stored {
+            apply_head_merge(tl, dedupe_cap(posts), after).await;
+        } else if first_paint {
+            store_head_fill(tl, posts, after).await;
+            *stored = true;
+        } else {
+            apply_head_merge(tl, dedupe_cap(posts), after).await;
+            *stored = true;
+        }
+    }
+
+    match first {
+        First::Browser(Ok(Ok((posts, after)))) => {
+            pending_http = Some(http_handle);
+            if !posts.is_empty() {
+                store_posts(&tl, first_paint, posts, after, &mut stored).await;
+            } else {
+                // Empty fast leg: don't store yet; the HTTP leg decides.
+                // (If HTTP also comes back empty/failed we fall through to
+                // the error/clear-loading handling below.)
             }
         }
-        // Gate exhausted or browser failed: fall through to HTTP below.
-    }
-    match fetch_http_fallback(&state.client, &sub, None).await {
-        Ok((posts, after)) => {
-            if first_paint {
+        First::Browser(Ok(Err(e))) => {
+            pending_http = Some(http_handle);
+            if e.contains("BLOCKED") {
+                browser_err = Some(e);
+            } else if e != "CHROME_DISABLED" && !e.contains("BROWSER_BUSY") {
+                let mut w = tl.write().await;
+                w.last_error = Some(e);
+            }
+            // BROWSER_BUSY / fast miss: HTTP decides alone.
+        }
+        First::Browser(Err(join_err)) => {
+            pending_http = Some(http_handle);
+            let mut w = tl.write().await;
+            w.last_error = Some(format!("browser task failed: {}", join_err));
+        }
+        First::Http(Ok(Ok((posts, after)))) => {
+            pending_browser = Some(browser_handle);
+            if !posts.is_empty() {
+                store_posts(&tl, first_paint, posts, after, &mut stored).await;
+            } else if first_paint {
+                // HTTP head is empty: still store it so loading clears and
+                // the tail cursor echoes; a later non-empty browser leg
+                // head-merges on top.
                 store_head_fill(&tl, posts, after).await;
+                stored = true;
             } else {
                 apply_head_merge(&tl, posts, after).await;
+                stored = true;
             }
         }
-        Err((code, msg, _)) => finish_with_error(&tl, code, msg).await,
+        First::Http(Ok(Err(e))) => {
+            pending_browser = Some(browser_handle);
+            http_err = Some(e);
+        }
+        First::Http(Err(join_err)) => {
+            pending_browser = Some(browser_handle);
+            http_err = Some((
+                StatusCode::BAD_GATEWAY,
+                format!("http task failed: {}", join_err),
+                None,
+            ));
+        }
+    }
+
+    // Head-merge the loser if it arrives later with unseen rows. The loser
+    // is already in flight and bounded (fast ~7s caps / reqwest timeout),
+    // so awaiting it never stalls a response — this task is background-only.
+    if let Some(handle) = pending_http {
+        match handle.await {
+            Ok(Ok((posts, after))) => {
+                if !posts.is_empty() {
+                    store_posts(&tl, first_paint && !stored, posts, after, &mut stored)
+                        .await;
+                } else if !stored {
+                    if first_paint {
+                        store_head_fill(&tl, posts, after).await;
+                    }
+                    stored = true;
+                }
+            }
+            Ok(Err(e)) => {
+                if http_err.is_none() {
+                    http_err = Some(e);
+                }
+            }
+            Err(join_err) => {
+                if http_err.is_none() {
+                    http_err = Some((
+                        StatusCode::BAD_GATEWAY,
+                        format!("http task failed: {}", join_err),
+                        None,
+                    ));
+                }
+            }
+        }
+    } else if let Some(handle) = pending_browser {
+        match handle.await {
+            Ok(Ok((posts, after))) => {
+                if !posts.is_empty() {
+                    store_posts(&tl, first_paint && !stored, posts, after, &mut stored)
+                        .await;
+                }
+                // Empty browser leg after an HTTP decision: nothing to do.
+                if !stored {
+                    stored = true;
+                    set_loading(&tl, false).await;
+                }
+            }
+            Ok(Err(e)) => {
+                if browser_err.is_none()
+                    && e.contains("BLOCKED")
+                {
+                    browser_err = Some(e);
+                } else if browser_err.is_none()
+                    && e != "CHROME_DISABLED"
+                    && !e.contains("BROWSER_BUSY")
+                {
+                    let mut w = tl.write().await;
+                    w.last_error = Some(e);
+                }
+                if !stored {
+                    stored = true;
+                    set_loading(&tl, false).await;
+                }
+            }
+            Err(join_err) => {
+                if !stored {
+                    let mut w = tl.write().await;
+                    w.last_error = Some(format!("browser task failed: {}", join_err));
+                    w.loading = false;
+                    stored = true;
+                }
+            }
+        }
+    }
+
+    if stored {
+        return;
+    }
+    // Neither leg produced rows: surface block/rate-limit state.
+    if let Some(e) = browser_err {
+        if e.contains("BLOCKED") {
+            mark_blocked(&tl, e).await;
+            return;
+        }
+    }
+    if let Some((code, msg, _)) = http_err {
+        finish_with_error(&tl, code, msg).await;
+    } else {
+        set_loading(&tl, false).await;
     }
 }
 
 /// Background pagination: fetch the next older reddit page (via the stored
 /// `reddit_after` cursor) and tail-merge only unseen older items. Serve-now,
 /// prefetch-in-background: the request that triggered this already returned.
+///
+/// HTTP-only by design: no browser nav slot, no dwell, no browser lock.
+/// Pagination therefore never contends the browser cell and can never delay
+/// a priority head fill. Same-sub overlap is still single-flight via
+/// try_lock (fail-fast, never queues); a sub switch targets a different
+/// per-sub lock, so focus changes need no abort — the old sub's paginate
+/// just tail-merges whenever its HTTP fetch lands.
 async fn background_paginate(state: AppState, sub: String) {
     let tl = timeline_arc(&state, &sub);
     {
@@ -1462,10 +1643,10 @@ async fn background_paginate(state: AppState, sub: String) {
             }
         }
     }
-    let (cursor, count) = {
+    let cursor = {
         let r = tl.read().await;
         match r.reddit_after.clone() {
-            Some(c) => (c, r.posts.len()),
+            Some(c) => c,
             None => return, // nothing older known; head refresh covers it
         }
     };
@@ -1474,30 +1655,6 @@ async fn background_paginate(state: AppState, sub: String) {
         return;
     };
     set_loading(&tl, true).await;
-    if !chrome_disabled() {
-        let gate_ok = {
-            let mut gate = state.nav_gate.lock().await;
-            nav_gate_reserve(&mut gate).is_ok()
-        };
-        if gate_ok {
-            match scrape_next_page_via_browser(&sub, &cursor, count).await {
-                Ok((posts, next_after)) => {
-                    apply_tail_merge(&tl, dedupe_cap(posts), next_after).await;
-                    return;
-                }
-                Err(e) => {
-                    if e.contains("BLOCKED") {
-                        mark_blocked(&tl, e).await;
-                        return;
-                    }
-                    let mut w = tl.write().await;
-                    w.last_error = Some(e);
-                }
-            }
-        }
-        // Gate exhausted or browser failed: HTTP pagination needs no nav
-        // slot, so keep going below.
-    }
     match fetch_http_fallback(&state.client, &sub, Some(&cursor)).await {
         Ok((posts, next_after)) => apply_tail_merge(&tl, posts, next_after).await,
         Err((code, msg, _)) => finish_with_error(&tl, code, msg).await,

@@ -125,7 +125,7 @@ impl Drop for TestServer {
 
 fn client() -> reqwest::blocking::Client {
     // Non-blocking API: first stealth navigation runs in the background
-    // (fast ~12s caps + dwell); poll with a short per-request timeout.
+    // (fast ~7s caps + dwell, raced with HTTP); poll with a short per-request timeout.
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(25))
         .build()

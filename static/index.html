@@ -316,6 +316,8 @@
             let retryCountdownTimer = null;
             const POLL_INTERVAL_MS = 2500;
             const POLL_MAX_MS = 90000;
+            // Switch start timestamp for the Fetching… Ns badge progress.
+            let fetchStartMs = 0;
 
             function sleep(ms) {
                 return new Promise((r) => setTimeout(r, ms));
@@ -385,7 +387,11 @@
                     ? new Date(data.fetchedAt).toLocaleTimeString()
                     : "never";
                 if (isLoading && rows === 0) {
-                    badge.textContent = `Fetching… (fetched ${when})`;
+                    const elapsed =
+                        fetchStartMs > 0
+                            ? Math.max(0, Math.floor((Date.now() - fetchStartMs) / 1000))
+                            : 0;
+                    badge.textContent = `Fetching… ${elapsed}s (fetched ${when})`;
                     badge.dataset.state = "loading";
                     badge.title = "Background fetch running — polling…";
                 } else if (isLoading) {
@@ -438,6 +444,7 @@
             async function fetchSubreddit(subreddit) {
                 const mySeq = ++switchSeq;
                 currentSub = subreddit;
+                fetchStartMs = Date.now();
                 afterCursor = null;
                 hasMore = false;
                 videos = [];
@@ -469,9 +476,10 @@
                         return;
                     }
                     if (data.loading) {
-                        // Empty + loading: background scrape still running
-                        // (12s fast nav + 45s rate gate + pagination). Poll
-                        // every ~2.5s up to ~90s for the first non-empty slice.
+                        // Empty + loading: background fetch still running
+                        // (7s fast nav race + priority gate + pagination).
+                        // Poll every ~2.5s up to ~90s for the first
+                        // non-empty slice; partial rows render instantly.
                         await pollUntilNonEmpty(subreddit, mySeq);
                         return;
                     }
@@ -955,6 +963,7 @@
                 .addEventListener("click", async () => {
                     const btn = document.getElementById("refreshBtn");
                     btn.disabled = true;
+                    fetchStartMs = Date.now();
                     playlist.innerHTML =
                         '<div class="loading">Refreshing…</div>';
                     updateFreshBadge({ stale: true, loading: true, videos, fetchedAt: null });
