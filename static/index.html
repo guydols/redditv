@@ -343,6 +343,20 @@
                             ? Number(errBody.retryAfterMs)
                             : null;
                     err.data = data;
+                    // Surface failures on the badge too (not just successes)
+                    // so countdowns/errors stay visible on empty+loading.
+                    try {
+                        updateFreshBadge({
+                            loading: true,
+                            stale: true,
+                            videos: [],
+                            fetchedAt: null,
+                            retryAfterMs: err.retryAfterMs,
+                        });
+                        if (err.retryAfterMs != null && err.retryAfterMs > 0) {
+                            showRetryCountdown(err.retryAfterMs);
+                        }
+                    } catch (_) {}
                     throw err;
                 }
                 updateFreshBadge(data);
@@ -407,10 +421,10 @@
                         ? "Served from the 1h server cache"
                         : "Fresh fetch";
                 }
-                // Countdown only when stale+rate-limited (rows present). An
-                // empty+loading first paint is a priority fetch, never a
-                // countdown.
-                if (data.retryAfterMs != null && Number(data.retryAfterMs) > 0 && rows > 0) {
+                // Countdown whenever the server gives one — including
+                // empty+loading (blocked backoff now carries retryAfterMs).
+                // An empty first paint with no retryAfterMs shows Fetching…
+                if (data.retryAfterMs != null && Number(data.retryAfterMs) > 0) {
                     showRetryCountdown(Number(data.retryAfterMs));
                 }
             }
@@ -550,8 +564,25 @@
                     try {
                         data = await fetchVideosPage(subreddit, null, false);
                     } catch (error) {
-                        // Empty first paint never counts down: keep the
-                        // Fetching indicator alive and retry.
+                        // Don't swallow: tick the badge + log so an
+                        // empty+loading first paint shows the error/countdown
+                        // instead of spinning silently.
+                        console.warn("pollUntilNonEmpty error, retrying:", error);
+                        try {
+                            updateFreshBadge({
+                                loading: true,
+                                stale: true,
+                                videos: [],
+                                fetchedAt: null,
+                                retryAfterMs:
+                                    error && error.retryAfterMs != null
+                                        ? Number(error.retryAfterMs)
+                                        : null,
+                            });
+                            if (error && error.retryAfterMs > 0) {
+                                showRetryCountdown(Number(error.retryAfterMs));
+                            }
+                        } catch (_) {}
                         continue;
                     }
                     if (mySeq !== switchSeq) return;
@@ -607,34 +638,43 @@
                     }
                     if (mySeq !== switchSeq || subreddit !== currentSub) return;
                     const fresh = (data.videos || []).map(mapBackendVideo);
-                    if (fresh.length > videos.length) {
+                    // Merge by unseen youtubeId, not slice length: equal
+                    // 25-slices with rotated ids must still update. Head
+                    // updates prepend newest-first (server merge_newest_head
+                    // order), never tail-append.
+                    {
+                        const seen = new Set(
+                            videos.map((v) => v.youtubeId || v.url),
+                        );
+                        const unseen = fresh.filter(
+                            (v) => !seen.has(v.youtubeId || v.url),
+                        );
                         const playingId =
                             videos[currentIndex] &&
                             (videos[currentIndex].youtubeId ||
                                 videos[currentIndex].url);
-                        const added = appendUnique(fresh);
-                        // Server head-merges newest-first; if the head slice
-                        // grew, adopt the fresh cursor/tail state.
-                        if (data.after !== undefined) {
-                            afterCursor = data.after || afterCursor;
-                        }
-                        hasMore = !!data.hasMore || !!data.loading;
-                        // Preserve the playing item after merge.
-                        if (playingId) {
-                            const idx = videos.findIndex(
-                                (v) =>
-                                    (v.youtubeId || v.url) === playingId,
-                            );
-                            if (idx >= 0) currentIndex = idx;
-                        }
-                        if (added > 0) renderPlaylistPreserve();
-                        else {
+                        if (unseen.length > 0) {
+                            videos = [...unseen, ...videos];
+                            // Adopt the fresh head cursor/tail state.
+                            if (data.after !== undefined) {
+                                afterCursor = data.after || afterCursor;
+                            }
                             hasMore = !!data.hasMore || !!data.loading;
-                        }
-                    } else {
-                        hasMore = !!data.hasMore || !!data.loading;
-                        if (data.after !== undefined && data.after) {
-                            afterCursor = afterCursor || data.after;
+                            // Preserve the playing item after the prepend
+                            // shifted indices.
+                            if (playingId) {
+                                const idx = videos.findIndex(
+                                    (v) =>
+                                        (v.youtubeId || v.url) === playingId,
+                                );
+                                if (idx >= 0) currentIndex = idx;
+                            }
+                            renderPlaylistPreserve();
+                        } else {
+                            hasMore = !!data.hasMore || !!data.loading;
+                            if (data.after !== undefined && data.after) {
+                                afterCursor = afterCursor || data.after;
+                            }
                         }
                     }
                     if (!data.loading) {
@@ -825,9 +865,24 @@
                     video.url.includes("youtube.com") ||
                     video.url.includes("youtu.be")
                 ) {
-                    // Play YouTube video
+                    // Play YouTube video (playback-only YT gate: the feed
+                    // never waits, but playback retries until the IFrame API
+                    // arrives — e.g. slow/ad-blocked loads).
                     const youtubeID = getYouTubeID(video.url);
                     if (youtubeID) {
+                        if (typeof YT === "undefined" || !YT.Player) {
+                            setTimeout(() => {
+                                if (
+                                    videos[currentIndex] &&
+                                    (videos[currentIndex].youtubeId ||
+                                        videos[currentIndex].url) ===
+                                        (video.youtubeId || video.url)
+                                ) {
+                                    playVideo(currentIndex);
+                                }
+                            }, 500);
+                            return;
+                        }
                         isYouTube = true;
                         videoPlayer.style.display = "none";
                         youtubePlayer.style.display = "block";
@@ -889,8 +944,12 @@
                 } else if (hasMore) {
                     // At the tail with more pending: fetch, then keep polling
                     // briefly for the tail-fill so the player auto-advances
-                    // without user intervention.
+                    // without user intervention. Each retry resets the client
+                    // overlap guard first — otherwise all 12 retries burn on
+                    // `loading===true` from the first loadMore and the tail
+                    // never advances.
                     const idx = currentIndex;
+                    loading = false;
                     await loadMore();
                     if (currentIndex < videos.length - 1) {
                         playVideo(currentIndex + 1);
@@ -901,6 +960,7 @@
                         if (!hasMore) break;
                         if (videos.length - 1 > idx) break;
                         await sleep(POLL_INTERVAL_MS);
+                        loading = false;
                         await loadMore();
                     }
                     if (currentIndex < videos.length - 1) {
@@ -1007,15 +1067,21 @@
                     }
                 });
 
-            // Initial load - wait for YouTube API
-            function initPlayer() {
-                if (typeof YT !== "undefined" && YT.Player) {
-                    fetchSubreddit("videos");
-                } else {
-                    setTimeout(initPlayer, 100);
-                }
+            // Initial load - fire the feed immediately, independent of the
+            // YouTube IFrame API (ad-blockers must not block the feed). The
+            // YT script keeps retrying separately for playback only.
+            function ensureYouTubeApi(retries = 40) {
+                if (typeof YT !== "undefined" && YT.Player) return;
+                if (retries <= 0) return;
+                setTimeout(() => ensureYouTubeApi(retries - 1), 500);
             }
-            initPlayer();
+            ensureYouTubeApi();
+            fetchSubreddit("videos");
+            // Short follow-up in case the first paint raced DOM readiness;
+            // no-ops into the same poll generation when rows already arrived.
+            setTimeout(() => {
+                if (videos.length === 0) fetchSubreddit("videos");
+            }, 2000);
 
             // Show shortcuts on first load
             setTimeout(() => {

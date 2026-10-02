@@ -73,6 +73,9 @@ const PREFETCH_TAIL_THRESHOLD: usize = 5;
 const MAX_NAVS_PER_HOUR: usize = 35;
 /// Backoff for a sub after a block/challenge was detected (~3h, within 2-4h).
 const BLOCKED_BACKOFF_MS: i64 = 3 * 3_600_000;
+/// Short backoff for transient/single-leg blocks on an empty timeline: the
+/// feed stays retryable instead of a 3h blackout (~5min).
+const SHORT_BLOCKED_BACKOFF_MS: i64 = 5 * 60_000;
 
 // ---------- state ----------
 
@@ -81,6 +84,7 @@ struct AppState {
     client: reqwest::Client,
     timelines: Arc<DashMap<String, Arc<RwLock<SubTimeline>>>>,
     inflight: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    paginate_inflight: Arc<DashMap<String, Arc<Mutex<()>>>>,
     nav_gate: Arc<Mutex<NavGate>>,
 }
 
@@ -1329,6 +1333,14 @@ fn inflight_lock(state: &AppState, sub: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+fn paginate_lock(state: &AppState, sub: &str) -> Arc<Mutex<()>> {
+    state
+        .paginate_inflight
+        .entry(sub.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn slice_body(
     sub: &str,
     tl: &SubTimeline,
@@ -1379,6 +1391,8 @@ fn slice_body(
 }
 
 /// Store a head fill in the timeline (first fetch / fresh newest page).
+/// Never clobbers a known t3_* cursor with a cursor-less (RSS-only) leg:
+// `reddit_after` is only assigned when Some.
 async fn store_head_fill(
     tl: &Arc<RwLock<SubTimeline>>,
     posts: Vec<VideoItem>,
@@ -1386,7 +1400,9 @@ async fn store_head_fill(
 ) {
     let mut w = tl.write().await;
     w.posts = dedupe_cap(posts);
-    w.reddit_after = reddit_after;
+    if reddit_after.is_some() {
+        w.reddit_after = reddit_after;
+    }
     w.fetched_at_ms = Some(now_ms());
     w.last_error = None;
     w.blocked_until_ms = None;
@@ -1434,7 +1450,15 @@ async fn set_loading(tl: &Arc<RwLock<SubTimeline>>, loading: bool) {
 async fn mark_blocked(tl: &Arc<RwLock<SubTimeline>>, reason: String) {
     let mut w = tl.write().await;
     w.last_error = Some("BLOCKED".to_string());
-    w.blocked_until_ms = Some(now_ms() + BLOCKED_BACKOFF_MS);
+    // Empty timelines get a short retryable backoff so a single transient
+    // 403 does not 3h-blackout the sub; populated timelines keep the 3h
+    // politeness backoff.
+    let backoff = if w.posts.is_empty() {
+        SHORT_BLOCKED_BACKOFF_MS
+    } else {
+        BLOCKED_BACKOFF_MS
+    };
+    w.blocked_until_ms = Some(now_ms() + backoff);
     w.loading = false;
     let _ = reason;
 }
@@ -1445,7 +1469,14 @@ async fn finish_with_error(tl: &Arc<RwLock<SubTimeline>>, code: StatusCode, msg:
         w.last_error = Some("UPSTREAM_429".to_string());
     } else if msg.contains("403") || msg.contains("BLOCKED") {
         w.last_error = Some("BLOCKED".to_string());
-        w.blocked_until_ms = Some(now_ms() + BLOCKED_BACKOFF_MS);
+        // Single-leg transient 403 on an empty timeline: short backoff so
+        // the feed stays retryable; non-empty timelines keep the 3h block.
+        let backoff = if w.posts.is_empty() {
+            SHORT_BLOCKED_BACKOFF_MS
+        } else {
+            BLOCKED_BACKOFF_MS
+        };
+        w.blocked_until_ms = Some(now_ms() + backoff);
     } else {
         w.last_error = Some(msg);
     }
@@ -1733,12 +1764,35 @@ async fn background_head_refresh(state: AppState, sub: String) {
     if stored {
         return;
     }
-    // Neither leg produced rows: surface block/rate-limit state.
-    if let Some(e) = browser_err {
-        if e.contains("BLOCKED") {
+    // Neither leg produced rows: surface block/rate-limit state. A single
+    // BLOCKED leg alone must not 3h-blackout the sub when the other leg
+    // failed differently (timeout/transient) — only a confirmed block on
+    // both legs (or an HTTP 403/BLOCKED of its own) escalates to mark_blocked.
+    let http_blocked = http_err
+        .as_ref()
+        .map(|(_, msg, _)| msg.contains("403") || msg.contains("BLOCKED"))
+        .unwrap_or(false);
+    let browser_blocked = browser_err
+        .as_ref()
+        .map(|e| e.contains("BLOCKED"))
+        .unwrap_or(false);
+    if browser_blocked && http_blocked {
+        // Confirmed block on both legs: escalate to backoff.
+        if let Some(e) = browser_err {
             mark_blocked(&tl, e).await;
             return;
         }
+    } else if browser_blocked {
+        // Single-leg browser BLOCKED with a non-block HTTP failure:
+        // record it without a 3h blackout so the next poll retries soon.
+        if let Some((code, msg, _)) = http_err {
+            finish_with_error(&tl, code, msg).await;
+        } else {
+            let mut w = tl.write().await;
+            w.last_error = browser_err.clone();
+            w.loading = false;
+        }
+        return;
     }
     if let Some((code, msg, _)) = http_err {
         finish_with_error(&tl, code, msg).await;
@@ -1774,7 +1828,7 @@ async fn background_paginate(state: AppState, sub: String) {
             None => return, // nothing older known; head refresh covers it
         }
     };
-    let lock = inflight_lock(&state, &sub);
+    let lock = paginate_lock(&state, &sub);
     let Ok(_guard) = lock.try_lock() else {
         return;
     };
@@ -1829,11 +1883,15 @@ async fn videos_handler(
     let tl = timeline_arc(&state, &sub);
 
     // Blocked backoff with nothing cached: fail fast without spawning.
+    // Includes retryAfterMs so the client can show a countdown instead of
+    // a dead error; loading semantics stay server-side via blocked_until.
     {
         let r = tl.read().await;
         if r.posts.is_empty() {
             if let Some(until) = r.blocked_until_ms {
-                if now_ms() < until {
+                let now = now_ms();
+                if now < until {
+                    let retry_ms = (until - now).max(0) as u64;
                     return error_json(
                         StatusCode::BAD_GATEWAY,
                         "UPSTREAM_BLOCKED",
@@ -1841,7 +1899,7 @@ async fn videos_handler(
                             "Reddit blocked automated access to r/{} (backoff); try again later",
                             sub
                         ),
-                        None,
+                        Some(retry_ms),
                     );
                 }
             }
@@ -1882,7 +1940,17 @@ async fn videos_handler(
         Head,
         None,
     }
-    let job = if len > 0 && near_tail && has_cursor && !already_loading {
+    // Head/paginate locks are split (inflight vs paginate_inflight): a tail
+    // prefetch proceeds over HTTP even while a head fill holds its lock.
+    // Likewise the handler must not stall the tail while head loading is
+    // true — paginate is dispatched whenever the cursor is near the tail,
+    // independent of already_loading (its own try_lock stays fail-fast).
+    let job = if len > 0 && near_tail && has_cursor {
+        // Paginate needs its own single-flight check; if a paginate job is
+        // already running its try_lock fails fast inside the task. Only
+        // suppress re-spawn when the timeline already reports loading AND
+        // there is no head work pending — head loading alone must not stall
+        // the tail. We dispatch paginate regardless; the task de-dupes.
         Job::Paginate
     } else if (is_stale || refresh_req || len == 0) && !already_loading {
         Job::Head
@@ -2018,6 +2086,7 @@ async fn main() {
         client,
         timelines: Arc::new(DashMap::new()),
         inflight: Arc::new(DashMap::new()),
+        paginate_inflight: Arc::new(DashMap::new()),
         nav_gate: Arc::new(Mutex::new(NavGate::default())),
     };
 
@@ -2225,5 +2294,87 @@ mod unit_tests {
         gate3.last_nav = Some(Instant::now() - Duration::from_secs(1));
         assert!(nav_gate_reserve_priority(&mut gate3).is_err());
         assert!(nav_gate_peek_priority(&mut gate3).is_err());
+    }
+
+    #[test]
+    fn stale_equal_length_head_merge_still_prepends_unseen() {
+        let existing: Vec<VideoItem> = (0..25)
+            .map(|i| {
+                vid(
+                    &format!("id{:09}", i),
+                    &format!("https://www.reddit.com/r/v/comments/c{:06}/x/", i),
+                )
+            })
+            .collect();
+        let mut fresh: Vec<VideoItem> = (100..105)
+            .map(|i| {
+                vid(
+                    &format!("id{:09}", i),
+                    &format!("https://www.reddit.com/r/v/comments/c{:06}/x/", i),
+                )
+            })
+            .collect();
+        fresh.extend(existing[..20].to_vec());
+        assert_eq!(fresh.len(), existing.len());
+        let merged = merge_newest_head(existing, fresh);
+        assert_eq!(merged.len(), 30);
+        for (i, n) in (100..105).enumerate() {
+            assert_eq!(merged[i].youtube_id, format!("id{:09}", n));
+        }
+        assert_eq!(merged[5].youtube_id, "id000000000");
+    }
+
+    #[tokio::test]
+    async fn rss_only_fill_keeps_known_cursor() {
+        let tl = Arc::new(RwLock::new(SubTimeline::default()));
+        {
+            let mut w = tl.write().await;
+            w.posts = vec![vid(
+                "aaa111aaa11",
+                "https://www.reddit.com/r/v/comments/abc1/x/",
+            )];
+            w.reddit_after = Some("t3_abc1".to_string());
+        }
+        store_head_fill(
+            &tl,
+            vec![vid(
+                "bbb222bbb22",
+                "https://www.reddit.com/r/v/comments/abc2/x/",
+            )],
+            None,
+        )
+        .await;
+        assert_eq!(
+            tl.read().await.reddit_after.as_deref(),
+            Some("t3_abc1"),
+            "RSS-only store must preserve the known cursor"
+        );
+        apply_head_merge(
+            &tl,
+            vec![vid(
+                "ccc333ccc33",
+                "https://www.reddit.com/r/v/comments/abc3/x/",
+            )],
+            None,
+        )
+        .await;
+        assert_eq!(
+            tl.read().await.reddit_after.as_deref(),
+            Some("t3_abc1"),
+            "cursor-less head merge must preserve the known cursor"
+        );
+        apply_head_merge(
+            &tl,
+            vec![vid(
+                "ddd444ddd44",
+                "https://www.reddit.com/r/v/comments/abc4/x/",
+            )],
+            Some("t3_abc4".to_string()),
+        )
+        .await;
+        assert_eq!(
+            tl.read().await.reddit_after.as_deref(),
+            Some("t3_abc4")
+        );
     }
 }
