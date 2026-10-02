@@ -316,6 +316,14 @@
             let retryCountdownTimer = null;
             const POLL_INTERVAL_MS = 2500;
             const POLL_MAX_MS = 90000;
+            // 429-cooldown backoff: honor server retryAfterMs, capped so a
+            // 5min negative cache never pins the UI, plus jitter to avoid
+            // thundering-herd retries.
+            const COOLDOWN_CAP_MS = 60000;
+            function cooldownDelayMs(ms) {
+                const base = Math.min(Number(ms) || 0, COOLDOWN_CAP_MS);
+                return base + Math.floor(Math.random() * 2000);
+            }
             // Switch start timestamp for the Fetching… Ns badge progress.
             let fetchStartMs = 0;
 
@@ -554,11 +562,17 @@
             }
 
             // Poll while (loading && empty) up to ~90s; auto-play first slice.
+            // Cooldown-aware: when the server reports retryAfterMs (429
+            // negative cache), back off to that delay (cap 60s + jitter)
+            // with a single retry timer instead of the tight 2.5s hammer.
+            // Fast polling resumes only after the cooldown expires.
             async function pollUntilNonEmpty(subreddit, mySeq) {
                 const deadline = Date.now() + POLL_MAX_MS;
+                let cooldownWaitMs = 0;
                 while (Date.now() < deadline) {
                     if (mySeq !== switchSeq) return;
-                    await sleep(POLL_INTERVAL_MS);
+                    await sleep(cooldownWaitMs > 0 ? cooldownWaitMs : POLL_INTERVAL_MS);
+                    cooldownWaitMs = 0;
                     if (mySeq !== switchSeq) return;
                     let data;
                     try {
@@ -581,6 +595,9 @@
                             });
                             if (error && error.retryAfterMs > 0) {
                                 showRetryCountdown(Number(error.retryAfterMs));
+                                // Back off to the server hint (cap + jitter),
+                                // single timer instead of tight loop.
+                                cooldownWaitMs = cooldownDelayMs(Number(error.retryAfterMs));
                             }
                         } catch (_) {}
                         continue;

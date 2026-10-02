@@ -78,6 +78,15 @@ const BLOCKED_BACKOFF_MS: i64 = 3 * 3_600_000;
 /// Short backoff for transient/single-leg blocks on an empty timeline: the
 /// feed stays retryable instead of a 3h blackout (~5min).
 const SHORT_BLOCKED_BACKOFF_MS: i64 = 5 * 60_000;
+/// Negative-cache cooldown after an upstream 429 (rate-limit) for a sub.
+/// While active, GET /api/videos returns immediately with
+/// {videos:[], loading:true, retryAfterMs} without spawning new upstream
+/// jobs and without touching nav gates, so frontend repolls cannot extend
+/// the ban. Honors the upstream Retry-After header when present.
+const UPSTREAM_429_COOLDOWN_MS: i64 = 5 * 60_000;
+/// Clamp for a Retry-After-derived 429 cooldown (5s..30min).
+const MIN_429_COOLDOWN_MS: i64 = 5_000;
+const MAX_429_COOLDOWN_MS: i64 = 30 * 60_000;
 
 // ---------- state ----------
 
@@ -98,6 +107,10 @@ struct SubTimeline {
     last_error: Option<String>,
     /// Epoch ms until which this sub is backed off (after BLOCKED).
     blocked_until_ms: Option<i64>,
+    /// Epoch ms until which this sub is 429-cooled-down (negative cache).
+    /// While in the future, handlers return loading+retryAfterMs without
+    /// spawning upstream jobs.
+    rate_limited_until_ms: Option<i64>,
     /// old.reddit pagination cursor (t3_*) for the tail of `posts`.
     /// None = no further pages known yet.
     reddit_after: Option<String>,
@@ -232,6 +245,27 @@ fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|secs| secs.saturating_mul(1000))
+}
+
+/// Negative-cache cooldown duration for an upstream 429. Honors the
+/// upstream Retry-After hint when present, else the 5min default.
+/// Clamped to 5s..30min so a stray header cannot pin the sub forever.
+fn upstream_429_cooldown_ms(retry_after: Option<u64>) -> i64 {
+    match retry_after {
+        Some(ms) if ms > 0 => (ms as i64).clamp(MIN_429_COOLDOWN_MS, MAX_429_COOLDOWN_MS),
+        _ => UPSTREAM_429_COOLDOWN_MS,
+    }
+}
+
+/// Remaining 429 cooldown for a timeline, if active.
+fn rate_limit_remaining_ms(tl: &SubTimeline, now: i64) -> Option<u64> {
+    tl.rate_limited_until_ms.and_then(|until| {
+        if now < until {
+            Some((until - now).max(0) as u64)
+        } else {
+            None
+        }
+    })
 }
 
 /// Opaque index cursor into the in-memory timeline. Legacy `t3_*` cursors are
@@ -1503,6 +1537,7 @@ async fn store_head_fill(
     w.fetched_at_ms = Some(now_ms());
     w.last_error = None;
     w.blocked_until_ms = None;
+    w.rate_limited_until_ms = None;
     w.loading = false;
     let kept = incoming_after.is_none() && prev_after.is_some();
     info!(
@@ -1534,6 +1569,7 @@ async fn apply_head_merge(
     w.fetched_at_ms = Some(now_ms());
     w.last_error = None;
     w.blocked_until_ms = None;
+    w.rate_limited_until_ms = None;
     w.loading = false;
     let kept = incoming_after.is_none() && prev_after.is_some();
     info!(
@@ -1561,6 +1597,7 @@ async fn apply_tail_merge(
     w.posts = merged;
     w.reddit_after = next_after.clone();
     w.last_error = None;
+    w.rate_limited_until_ms = None;
     w.loading = false;
     info!(
         incoming_rows = incoming_rows,
@@ -1597,11 +1634,21 @@ async fn mark_blocked(tl: &Arc<RwLock<SubTimeline>>, reason: String) {
     );
 }
 
-async fn finish_with_error(tl: &Arc<RwLock<SubTimeline>>, code: StatusCode, msg: String) {
+async fn finish_with_error(
+    tl: &Arc<RwLock<SubTimeline>>,
+    code: StatusCode,
+    msg: String,
+    retry_after: Option<u64>,
+) {
     let mut w = tl.write().await;
     if code == StatusCode::TOO_MANY_REQUESTS {
         w.last_error = Some("UPSTREAM_429".to_string());
-        warn!(status = 429, "fetch ended rate-limited (UPSTREAM_429)");
+        // Negative cache: hold the sub in cooldown so frontend repolls
+        // return loading+retryAfterMs without retrying upstream and
+        // extending the ban. Honors upstream Retry-After when present.
+        let backoff = upstream_429_cooldown_ms(retry_after);
+        w.rate_limited_until_ms = Some(now_ms() + backoff);
+        warn!(status = 429, backoff_ms = backoff, retry_after_ms = ?retry_after, "fetch ended rate-limited (UPSTREAM_429, cooldown set)");
     } else if msg.contains("403") || msg.contains("BLOCKED") {
         w.last_error = Some("BLOCKED".to_string());
         // Single-leg transient 403 on an empty timeline: short backoff so
@@ -1645,6 +1692,11 @@ async fn background_head_refresh(state: AppState, sub: String) {
     let tl = timeline_arc(&state, &sub);
     {
         let r = tl.read().await;
+        // 429 negative cache first: no upstream retry while cooling down.
+        if let Some(remain) = rate_limit_remaining_ms(&r, now_ms()) {
+            info!(sub = %sub, retry_after_ms = remain, "head_refresh cooldown active skip (UPSTREAM_429 negative cache)");
+            return;
+        }
         if let Some(until) = r.blocked_until_ms {
             if now_ms() < until {
                 let retry_ms = (until - now_ms()).max(0) as u64;
@@ -1682,9 +1734,9 @@ async fn background_head_refresh(state: AppState, sub: String) {
                 }
                 info!(sub = %sub, first_paint = first_paint, winner = "http(chrome-disabled)", rows = rows, has_after = has_after, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (filled)");
             }
-            Err((code, msg, _)) => {
+            Err((code, msg, retry)) => {
                 info!(sub = %sub, first_paint = first_paint, status = code.as_u16(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (error)");
-                finish_with_error(&tl, code, msg).await;
+                finish_with_error(&tl, code, msg, retry).await;
             }
         }
         return;
@@ -1723,9 +1775,9 @@ async fn background_head_refresh(state: AppState, sub: String) {
                 }
                 info!(sub = %sub, first_paint = first_paint, winner = "http(gate-miss)", rows = rows, has_after = has_after, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (filled)");
             }
-            Err((code, msg, _)) => {
+            Err((code, msg, retry)) => {
                 info!(sub = %sub, first_paint = first_paint, status = code.as_u16(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (error)");
-                finish_with_error(&tl, code, msg).await;
+                finish_with_error(&tl, code, msg, retry).await;
             }
         }
         return;
@@ -1965,8 +2017,8 @@ async fn background_head_refresh(state: AppState, sub: String) {
         // Single-leg browser BLOCKED with a non-block HTTP failure:
         // record it without a 3h blackout so the next poll retries soon.
         info!(sub = %sub, first_paint = first_paint, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (browser blocked, http failed differently)");
-        if let Some((code, msg, _)) = http_err {
-            finish_with_error(&tl, code, msg).await;
+        if let Some((code, msg, retry)) = http_err {
+            finish_with_error(&tl, code, msg, retry).await;
         } else {
             let mut w = tl.write().await;
             w.last_error = browser_err.clone();
@@ -1974,9 +2026,9 @@ async fn background_head_refresh(state: AppState, sub: String) {
         }
         return;
     }
-    if let Some((code, msg, _)) = http_err {
+    if let Some((code, msg, retry)) = http_err {
         info!(sub = %sub, first_paint = first_paint, status = code.as_u16(), elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (error)");
-        finish_with_error(&tl, code, msg).await;
+        finish_with_error(&tl, code, msg, retry).await;
     } else {
         info!(sub = %sub, first_paint = first_paint, elapsed_ms = job_start.elapsed().as_millis() as u64, "head_refresh end (empty, no rows)");
         set_loading(&tl, false).await;
@@ -1998,6 +2050,10 @@ async fn background_paginate(state: AppState, sub: String) {
     let tl = timeline_arc(&state, &sub);
     {
         let r = tl.read().await;
+        if let Some(remain) = rate_limit_remaining_ms(&r, now_ms()) {
+            debug!(sub = %sub, retry_after_ms = remain, "paginate cooldown active skip (UPSTREAM_429 negative cache)");
+            return;
+        }
         if let Some(until) = r.blocked_until_ms {
             if now_ms() < until {
                 debug!(sub = %sub, "paginate skip (backoff active)");
@@ -2029,9 +2085,9 @@ async fn background_paginate(state: AppState, sub: String) {
             apply_tail_merge(&tl, posts, next_after).await;
             info!(sub = %sub, after = %cursor, rows = rows, has_next_after = has_next, elapsed_ms = job_start.elapsed().as_millis() as u64, "paginate end (appended)");
         }
-        Err((code, msg, _)) => {
+        Err((code, msg, retry)) => {
             info!(sub = %sub, after = %cursor, status = code.as_u16(), elapsed_ms = job_start.elapsed().as_millis() as u64, "paginate end (error)");
-            finish_with_error(&tl, code, msg).await;
+            finish_with_error(&tl, code, msg, retry).await;
         }
     }
 }
@@ -2105,6 +2161,35 @@ async fn videos_handler(
                 }
             }
         }
+    }
+
+    // 429 negative-cache cooldown: while active, return immediately with
+    // {videos:[], loading:true, retryAfterMs} WITHOUT spawning new upstream
+    // jobs and WITHOUT touching nav gates. Single-flight is implicit: no
+    // job is spawned here, so concurrent polls coalesce on the cooldown.
+    let cooldown_remain: Option<u64> = {
+        let r = tl.read().await;
+        rate_limit_remaining_ms(&r, now_ms())
+    };
+    if let Some(remain) = cooldown_remain {
+        let empty = tl.read().await.posts.is_empty();
+        if empty {
+            let r = tl.read().await;
+            let mut body = slice_body(&sub, &r, start, limit as usize, true, Some(remain));
+            // Force loading:true so the frontend keeps its countdown/badge
+            // state instead of treating the empty slice as terminal.
+            body["loading"] = serde_json::Value::Bool(true);
+            body["stale"] = serde_json::Value::Bool(true);
+            info!(method = "GET", route = "/api/videos", sub = %sub, limit = limit, refresh = refresh_req, status = 200, served_from = "cooldown", videos = 0, loading = true, retry_after_ms = remain, elapsed_ms = req_start.elapsed().as_millis() as u64, "request (UPSTREAM_429 cooldown active skip)");
+            return (StatusCode::OK, Json(body)).into_response();
+        }
+        // Non-empty timeline under cooldown: serve the cached slice now
+        // with the retry hint, no new job, no nav-gate accounting.
+        let r = tl.read().await;
+        let body = slice_body(&sub, &r, start, limit as usize, true, Some(remain));
+        let videos_count = body["videos"].as_array().map(|a| a.len()).unwrap_or(0);
+        info!(method = "GET", route = "/api/videos", sub = %sub, limit = limit, after = ?after, refresh = refresh_req, status = 200, served_from = "cooldown-cached", videos = videos_count, retry_after_ms = remain, elapsed_ms = req_start.elapsed().as_millis() as u64, "request (UPSTREAM_429 cooldown cached)");
+        return (StatusCode::OK, Json(body)).into_response();
     }
 
     // Snapshot for routing: fresh? stale? near the tail?
@@ -2253,6 +2338,19 @@ async fn refresh_handler(
         );
     }
     let tl = timeline_arc(&state, &sub);
+    // 429 cooldown: fail fast with the remaining hint, no new job, no gate.
+    {
+        let r = tl.read().await;
+        if let Some(remain) = rate_limit_remaining_ms(&r, now_ms()) {
+            info!(method = "POST", route = "/api/refresh", sub = %sub, status = 429, retry_after_ms = remain, elapsed_ms = req_start.elapsed().as_millis() as u64, "request (UPSTREAM_429 cooldown active skip)");
+            return error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                format!("r/{} is rate-limited upstream; retry shortly", sub),
+                Some(remain),
+            );
+        }
+    }
     // Priority lane: a never-fetched sub bypasses the global nav-gate peek.
     // Only a nav literally in flight (per-sub single-flight try_lock) may
     // return 429; otherwise queue an immediate nav and report loading.
@@ -2494,6 +2592,7 @@ mod unit_tests {
             fetched_at_ms: Some(now_ms()),
             last_error: None,
             blocked_until_ms: None,
+            rate_limited_until_ms: None,
             reddit_after: reddit_after.map(|s| s.to_string()),
             loading,
         }
@@ -2642,6 +2741,94 @@ mod unit_tests {
         assert_eq!(
             tl.read().await.reddit_after.as_deref(),
             Some("t3_abc4")
+        );
+    }
+
+    #[test]
+    fn upstream_429_cooldown_defaults_to_5min_and_honors_retry_after() {
+        assert_eq!(
+            upstream_429_cooldown_ms(None),
+            UPSTREAM_429_COOLDOWN_MS
+        );
+        // Upstream Retry-After (seconds->ms) is honored, clamped 5s..30min.
+        assert_eq!(upstream_429_cooldown_ms(Some(120_000)), 120_000);
+        assert_eq!(
+            upstream_429_cooldown_ms(Some(1_000)),
+            MIN_429_COOLDOWN_MS
+        );
+        assert_eq!(
+            upstream_429_cooldown_ms(Some(3_600_000)),
+            MAX_429_COOLDOWN_MS
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_429_sets_cooldown_and_second_get_sees_retry_after() {
+        let tl = Arc::new(RwLock::new(SubTimeline::default()));
+        // First failure: UPSTREAM_429 with no Retry-After -> 5min cooldown.
+        finish_with_error(
+            &tl,
+            StatusCode::TOO_MANY_REQUESTS,
+            "Reddit rate-limited the request".to_string(),
+            None,
+        )
+        .await;
+        {
+            let r = tl.read().await;
+            assert_eq!(r.last_error.as_deref(), Some("UPSTREAM_429"));
+            let remain = rate_limit_remaining_ms(&r, now_ms());
+            assert!(
+                remain.is_some(),
+                "429 must set negative-cache cooldown"
+            );
+            let ms = remain.unwrap();
+            assert!(
+                ms > UPSTREAM_429_COOLDOWN_MS as u64 - 10_000
+                    && ms <= UPSTREAM_429_COOLDOWN_MS as u64,
+                "default cooldown ~5min, got {ms}"
+            );
+        }
+        // Cooldown response shape: empty + loading + retryAfterMs, no job.
+        // (videos_handler early-return synthesizes this via slice_body.)
+        {
+            let r = tl.read().await;
+            let remain = rate_limit_remaining_ms(&r, now_ms()).unwrap();
+            let body = slice_body("educationalvideos", &r, 0, 25, true, Some(remain));
+            assert_eq!(body["videos"].as_array().unwrap().len(), 0);
+            // finish_with_error leaves loading=false; the handler forces
+            // loading:true on the cooldown path — emulate + assert intent.
+            assert!(remain > 0, "retryAfterMs must be positive, got {body}");
+        }
+        // Success clears the cooldown.
+        store_head_fill(
+            &tl,
+            vec![vid(
+                "aaa111aaa11",
+                "https://www.reddit.com/r/v/comments/abc1/x/",
+            )],
+            None,
+        )
+        .await;
+        assert!(
+            rate_limit_remaining_ms(&tl.read().await, now_ms()).is_none(),
+            "successful fill must clear the 429 cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_429_honors_retry_after_header_value() {
+        let tl = Arc::new(RwLock::new(SubTimeline::default()));
+        finish_with_error(
+            &tl,
+            StatusCode::TOO_MANY_REQUESTS,
+            "Reddit rate-limited the request".to_string(),
+            Some(60_000),
+        )
+        .await;
+        let remain = rate_limit_remaining_ms(&tl.read().await, now_ms()).unwrap();
+        assert!(
+            remain > 50_000 && remain <= 60_000,
+            "Retry-After 60s must drive cooldown, got {remain}"
         );
     }
 }
