@@ -551,7 +551,10 @@ fn never_fetched_first_request_is_instant_loading_without_429() {
     };
     let (s1, b1, e1) = get(&url);
     assert_eq!(s1, 200, "never-fetched first paint must not be 429, got {s1}: {b1}");
-    assert!(e1 < Duration::from_secs(20), "first paint blocked {e1:?}: {b1}");
+    // Instant-response contract: the handler never awaits fetch legs — it
+    // spawns the background job and returns {videos:[], loading:true} in
+    // <500ms even while upstream would take 4s+ per leg.
+    assert!(e1 < Duration::from_millis(500), "first paint blocked {e1:?}: {b1}");
     assert_eq!(b1.get("loading").and_then(|l| l.as_bool()), Some(true), "first paint must report loading:true, got {b1}");
     let empty1 = b1.get("videos").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false);
     if empty1 {
@@ -561,13 +564,37 @@ fn never_fetched_first_request_is_instant_loading_without_429() {
     // Immediate second switch inside the 45s MIN_NAV_GAP: still priority.
     let (s2, b2, e2) = get(&url);
     assert_eq!(s2, 200, "priority lane must survive the nav gap, got {s2}: {b2}");
-    assert!(e2 < Duration::from_secs(20), "second paint blocked {e2:?}: {b2}");
+    assert!(e2 < Duration::from_millis(500), "second paint blocked {e2:?}: {b2}");
     assert!(b2.get("loading").and_then(|l| l.as_bool()).is_some(), "loading must be bool, got {b2}");
     let empty2 = b2.get("videos").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false);
     if empty2 {
         assert!(b2.get("retryAfterMs").is_none() || b2.get("retryAfterMs").unwrap().is_null(),
             "empty second paint must not carry a countdown, got {b2}");
     }
+}
+
+/// Never-fetched first paint never awaits upstream: even with all fetch legs
+/// unanswered, GET returns in <500ms with {videos:[], loading:true}.
+#[test]
+fn never_fetched_get_returns_under_500ms_without_awaiting_upstream() {
+    let srv = TestServer::spawn();
+    // Unique sub guarantees never-fetched on this fresh server.
+    let pid = std::process::id();
+    let url = format!("{}/api/videos?sub=neverfetched{pid}&limit=5", srv.base);
+    let started = std::time::Instant::now();
+    let r = client().get(&url).send().unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(r.status(), 200, "never-fetched must be 200 loading, not 429/502");
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(
+        body.get("loading").and_then(|l| l.as_bool()),
+        Some(true),
+        "must return loading:true immediately, got {body}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "handler awaited fetch legs ({elapsed:?}); must return <500ms, got {body}"
+    );
 }
 
 /// Tail-pagination contract: GET with after==len echoes the tail index

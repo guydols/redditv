@@ -61,6 +61,11 @@ const FAST_DWELL: Duration = Duration::from_secs(2);
 /// is contended longer than this, skip straight to HTTP (browser stays
 /// reserved for background enrichment only).
 const FAST_BROWSER_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+/// Fast first-paint budgets: each HTTP leg gets this long on a never-fetched
+/// sub so the background fill lands in ~4s instead of stacking sequential
+/// 10s reqwest timeouts (public -> OAuth token POST -> OAuth fetch -> RSS).
+/// Longer budgets stay reserved for background enrichment/pagination.
+const FAST_HTTP_LEG_TIMEOUT: Duration = Duration::from_secs(4);
 /// When a slice ends within this many items of the tail, serve it now and
 /// prefetch the next reddit page in the background.
 const PREFETCH_TAIL_THRESHOLD: usize = 5;
@@ -863,6 +868,102 @@ async fn fetch_http_fallback(
     }
 }
 
+/// Fast first-paint HTTP fill for never-fetched subs: public JSON and RSS run
+/// concurrently, each capped at FAST_HTTP_LEG_TIMEOUT (~4s). OAuth is
+/// deliberately skipped here — the token POST would block first paint on a
+/// second sequential timeout chain; it stays deferred to background
+/// enrichment (fetch_http_fallback) after first paint. Returns merged,
+/// deduped rows (public order first, RSS unseen appended) with the public
+/// `after` cursor when known. A 429 from either leg surfaces as 429 when no
+/// rows are available; timeouts are treated as a missed leg, not fatal.
+async fn fetch_http_first_paint(
+    client: &reqwest::Client,
+    sub: &str,
+) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    let ua = reddit_ua();
+    const FILL_LIMIT: u32 = 100;
+    let (pub_res, rss_res) = tokio::join!(
+        tokio::time::timeout(
+            FAST_HTTP_LEG_TIMEOUT,
+            fetch_public_json(client, &ua, sub, FILL_LIMIT, None)
+        ),
+        tokio::time::timeout(FAST_HTTP_LEG_TIMEOUT, fetch_rss_fallback(client, &ua, sub)),
+    );
+    // Normalize: timeout -> None (leg missed its budget).
+    enum Leg<T> {
+        Hit(T),
+        Miss429(Option<u64>),
+        Miss(String),
+        Timeout,
+    }
+    let pub_leg: Leg<(Vec<VideoItem>, Option<String>)> = match pub_res {
+        Err(_) => Leg::Timeout,
+        Ok(Ok(ok)) => Leg::Hit(ok),
+        Ok(Err((code, msg, retry))) => {
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                Leg::Miss429(retry)
+            } else {
+                Leg::Miss(msg)
+            }
+        }
+    };
+    let rss_leg: Leg<Vec<VideoItem>> = match rss_res {
+        Err(_) => Leg::Timeout,
+        Ok(Ok(ok)) => Leg::Hit(ok),
+        Ok(Err((code, msg, retry))) => {
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                Leg::Miss429(retry)
+            } else {
+                Leg::Miss(msg)
+            }
+        }
+    };
+    match (pub_leg, rss_leg) {
+        (Leg::Hit((pvideos, pafter)), Leg::Hit(rvideos)) => {
+            if pvideos.is_empty() && rvideos.is_empty() {
+                Ok((Vec::new(), pafter))
+            } else {
+                let extra = filter_unseen_older(&pvideos, rvideos);
+                let mut merged = Vec::with_capacity(pvideos.len() + extra.len());
+                merged.extend(pvideos);
+                merged.extend(extra);
+                Ok((dedupe_cap(merged), pafter))
+            }
+        }
+        (Leg::Hit((pvideos, pafter)), _) => Ok((dedupe_cap(pvideos), pafter)),
+        (_, Leg::Hit(rvideos)) => Ok((dedupe_cap(rvideos), None)),
+        (Leg::Miss429(r), Leg::Miss429(_)) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Reddit rate-limited the request".to_string(),
+            r,
+        )),
+        (Leg::Miss429(r), _) | (_, Leg::Miss429(r)) => {
+            // One leg rate-limited while the other missed/timed out with no
+            // rows: surface the 429 so politeness backoff still applies.
+            Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "Reddit rate-limited the request".to_string(),
+                r,
+            ))
+        }
+        (Leg::Miss(m1), Leg::Miss(m2)) => Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Reddit upstream failed ({}; fallback: {})", m1, m2),
+            None,
+        )),
+        (Leg::Miss(m), Leg::Timeout) | (Leg::Timeout, Leg::Miss(m)) => Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Reddit upstream failed: {}", m),
+            None,
+        )),
+        (Leg::Timeout, Leg::Timeout) => Err((
+            StatusCode::BAD_GATEWAY,
+            "Reddit upstream timed out (fast first paint)".to_string(),
+            None,
+        )),
+    }
+}
+
 // ---------- stealth headless browser (chromiumoxide) ----------
 
 /// Single long-lived browser, lazily started on the first cache miss.
@@ -1363,10 +1464,14 @@ async fn gate_retry_hint(state: &AppState) -> Option<u64> {
 ///
 /// Race, don't sequence: the browser leg (fast ~7s caps, nav slot
 /// reserved, 1s lock timeout so it never queues behind a busy browser)
-/// runs concurrently with the reqwest chain (needs no navigation).
+/// runs concurrently with the reqwest legs. First paint uses fast parallel
+/// HTTP legs (public JSON + RSS ~4s each via tokio::join, OAuth token POST
+/// skipped/deferred to enrichment) so a never-fetched sub fills in ~4s
+/// instead of stacking sequential 10s timeouts. Enrichment keeps the full
+/// public -> OAuth -> RSS chain with longer budgets.
 /// The first leg with rows>0 does the head fill; the loser head-merges
 /// unseen rows if it arrives later. BROWSER_BUSY / gate exhaustion just
-/// means the HTTP leg decides alone.
+/// means the HTTP legs decide alone.
 async fn background_head_refresh(state: AppState, sub: String) {
     let tl = timeline_arc(&state, &sub);
     {
@@ -1385,8 +1490,15 @@ async fn background_head_refresh(state: AppState, sub: String) {
     set_loading(&tl, true).await;
     let first_paint = tl.read().await.posts.is_empty();
     // Chrome-disabled (CI/tests): HTTP-only head fill, no race needed.
+    // First paint uses the fast parallel legs (public+RSS ~4s each, OAuth
+    // skipped); enrichment keeps the full sequential chain + OAuth.
     if chrome_disabled() {
-        match fetch_http_fallback(&state.client, &sub, None).await {
+        let res = if first_paint {
+            fetch_http_first_paint(&state.client, &sub).await
+        } else {
+            fetch_http_fallback(&state.client, &sub, None).await
+        };
+        match res {
             Ok((posts, after)) => {
                 if first_paint {
                     store_head_fill(&tl, posts, after).await;
@@ -1411,7 +1523,13 @@ async fn background_head_refresh(state: AppState, sub: String) {
     };
     if !gate_ok {
         // Gate exhausted: HTTP needs no nav slot, so it still makes progress.
-        match fetch_http_fallback(&state.client, &sub, None).await {
+        // Fast legs on first paint; full chain for enrichment.
+        let res = if first_paint {
+            fetch_http_first_paint(&state.client, &sub).await
+        } else {
+            fetch_http_fallback(&state.client, &sub, None).await
+        };
+        match res {
             Ok((posts, after)) => {
                 if first_paint {
                     store_head_fill(&tl, posts, after).await;
@@ -1425,16 +1543,22 @@ async fn background_head_refresh(state: AppState, sub: String) {
     }
     // Politeness: the nav slot above covers the browser leg. Race both legs
     // concurrently so HTTP first paint never waits out the ~7s+7s+2s
-    // browser budget.
+    // browser budget. First paint: fast parallel HTTP legs (public+RSS ~4s
+    // each, OAuth skipped); enrichment: full chain with longer budgets.
     let http_client = state.client.clone();
     let sub_http = sub.clone();
     let sub_browser = sub.clone();
     let mut browser_handle =
         tokio::spawn(async move { scrape_sub_via_browser(&sub_browser, true).await });
-    let mut http_handle =
+    let mut http_handle = if first_paint {
+        tokio::spawn(
+            async move { fetch_http_first_paint(&http_client, &sub_http).await },
+        )
+    } else {
         tokio::spawn(
             async move { fetch_http_fallback(&http_client, &sub_http, None).await },
-        );
+        )
+    };
 
     type BrowserOut = Result<(Vec<VideoItem>, Option<String>), String>;
     type HttpOut = Result<
