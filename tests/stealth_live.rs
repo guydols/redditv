@@ -124,16 +124,18 @@ impl Drop for TestServer {
 }
 
 fn client() -> reqwest::blocking::Client {
-    // First stealth navigation can take a while (45s nav timeout + 20s
-    // selector wait + dwell); be generous on the client side.
+    // Non-blocking API: first stealth navigation runs in the background
+    // (fast ~12s caps + dwell); poll with a short per-request timeout.
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(150))
+        .timeout(Duration::from_secs(25))
         .build()
         .unwrap()
 }
 
 /// Live stealth check: single polite navigation (r/videos, limit 5).
 /// See module docs for the pass/blocked/skip contract.
+/// Non-blocking API: the first GET returns loading:true while the browser
+/// job runs, so poll until videos arrive (up to ~120s).
 #[test]
 #[ignore]
 fn stealth_live_videos_single_navigation() {
@@ -143,40 +145,59 @@ fn stealth_live_videos_single_navigation() {
     }
     let srv = TestServer::spawn_stealth();
     let url = format!("{}/api/videos?sub=videos&limit=5&refresh=true", srv.base);
-    eprintln!("GET {url} (single stealth navigation)");
-    let r = client().get(&url).send().expect("request to test server failed");
-    let status = r.status().as_u16();
-    let body: serde_json::Value = r.json().expect("expected JSON body");
-    println!("stealth_live status={status} body={body}");
-    if status == 200 {
-        let videos = body
+    eprintln!("GET {url} (single stealth navigation, polling)");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let r = client().get(&url).send().expect("request to test server failed");
+        let status = r.status().as_u16();
+        let body: serde_json::Value = r.json().expect("expected JSON body");
+        let count = body
             .get("videos")
             .and_then(|v| v.as_array())
-            .unwrap_or_else(|| panic!("expected videos[] array, got {body}"));
-        assert!(
-            !videos.is_empty(),
-            "stealth path returned 200 with zero rows: {body}"
-        );
-        println!(
-            "stealth_live PASS: {} rows, after={}",
-            videos.len(),
-            body.get("after").unwrap_or(&serde_json::Value::Null)
-        );
-        return;
+            .map(|a| a.len())
+            .unwrap_or(0);
+        println!("stealth_live poll status={status} rows={count} body={body}");
+        if status == 200 && count > 0 {
+            println!(
+                "stealth_live PASS: {} rows, after={}",
+                count,
+                body.get("after").unwrap_or(&serde_json::Value::Null)
+            );
+            return;
+        }
+        if [429, 502].contains(&status) {
+            let code = body
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            // Environment-blocked outcomes: document, don't fail as a code bug.
+            // Only stop polling early on explicit rate-limit/blocked codes
+            // after at least one attempt; loading:true + 200/empty keeps polling.
+            if ["RATE_LIMITED", "UPSTREAM_429", "UPSTREAM_BLOCKED"].contains(&code)
+                && body.get("videos").is_none()
+            {
+                println!("stealth_live ENVIRONMENT-BLOCKED (not a code bug): status={status} code={code}");
+                return;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            assert!(
+                [429, 502].contains(&status),
+                "expected 200 rows or 429/502 environment-blocked, got {status}: {body}"
+            );
+            let code = body
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            assert!(
+                ["RATE_LIMITED", "UPSTREAM_429", "UPSTREAM_BLOCKED"].contains(&code),
+                "expected RATE_LIMITED / UPSTREAM_429 / UPSTREAM_BLOCKED error code, got {body}"
+            );
+            println!("stealth_live ENVIRONMENT-BLOCKED (not a code bug): status={status} code={code}");
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(4));
     }
-    // Environment-blocked outcomes: document, don't fail as a code bug.
-    assert!(
-        [429, 502].contains(&status),
-        "expected 200 rows or 429/502 environment-blocked, got {status}: {body}"
-    );
-    let code = body
-        .get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    assert!(
-        ["RATE_LIMITED", "UPSTREAM_429", "UPSTREAM_BLOCKED"].contains(&code),
-        "expected RATE_LIMITED / UPSTREAM_429 / UPSTREAM_BLOCKED error code, got {body}"
-    );
-    println!("stealth_live ENVIRONMENT-BLOCKED (not a code bug): status={status} code={code}");
 }

@@ -345,14 +345,29 @@
             }
 
             function mapBackendVideo(v) {
+                const url = v.youtubeUrl || "";
                 return {
+                    youtubeId: v.youtubeId || getYouTubeID(url) || url,
                     title: v.title || "Untitled",
-                    url: v.youtubeUrl,
+                    url: url,
                     thumbnail: v.thumbnail,
                     isRedditVideo: false,
                     redditVideo: null,
                     redditUrl: v.redditUrl,
                 };
+            }
+
+            function appendUnique(more) {
+                const seen = new Set(videos.map((v) => v.youtubeId || v.url));
+                let added = 0;
+                for (const v of more) {
+                    const key = v.youtubeId || v.url;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    videos.push(v);
+                    added++;
+                }
+                return added;
             }
 
             async function fetchSubreddit(subreddit) {
@@ -361,17 +376,33 @@
                 hasMore = false;
                 videos = [];
                 currentIndex = 0;
+                // Instant switch: clear the list + show Loading immediately,
+                // then render the first slice when ready.
                 playlist.innerHTML =
                     '<div class="loading">Loading videos...</div>';
                 try {
-                    const data = await fetchVideosPage(subreddit, null, false);
+                    let data = await fetchVideosPage(subreddit, null, false);
+                    // Stale/missing cache returns {videos: [], loading:true}
+                    // while the background job runs: poll once after 2s.
+                    if (
+                        data.loading &&
+                        (!data.videos || data.videos.length === 0)
+                    ) {
+                        await new Promise((r) => setTimeout(r, 2000));
+                        data = await fetchVideosPage(subreddit, null, false);
+                    }
                     videos = (data.videos || []).map(mapBackendVideo);
                     afterCursor = data.after || null;
-                    hasMore = !!data.hasMore;
+                    // loading:true with no index cursor still means more may
+                    // arrive (background job pending / reddit_after cursor).
+                    hasMore = !!data.hasMore || !!data.loading;
                     renderPlaylist();
                     observeSentinel();
                     if (videos.length > 0) {
                         playVideo(0);
+                    } else if (data.loading) {
+                        playlist.innerHTML =
+                            '<div class="loading">Loading videos...</div>';
                     }
                 } catch (error) {
                     console.error("Error fetching subreddit:", error);
@@ -383,12 +414,16 @@
             async function loadMore() {
                 if (loading || !hasMore) return;
                 loading = true;
+                const sentinel = document.getElementById("playlistSentinel");
+                if (sentinel) sentinel.textContent = "Loading more…";
                 try {
                     const data = await fetchVideosPage(currentSub, afterCursor, false);
                     const more = (data.videos || []).map(mapBackendVideo);
-                    videos = videos.concat(more);
+                    appendUnique(more);
                     afterCursor = data.after || null;
-                    hasMore = !!data.hasMore;
+                    // Keep paging while the server has an index tail, a
+                    // reddit_after cursor, or a background job pending.
+                    hasMore = !!data.hasMore || !!data.loading;
                     renderPlaylist();
                     observeSentinel();
                 } catch (error) {
@@ -610,7 +645,7 @@
                         );
                         videos = (data.videos || []).map(mapBackendVideo);
                         afterCursor = data.after || null;
-                        hasMore = !!data.hasMore;
+                        hasMore = !!data.hasMore || !!data.loading;
                         currentIndex = 0;
                         renderPlaylist();
                         observeSentinel();

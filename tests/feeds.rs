@@ -161,6 +161,140 @@ fn bad_limit_returns_400() {
     }
 }
 
+/// Fast-switch contract: GET /api/videos never blocks on the browser.
+/// A stale/missing cache returns immediately (200) with the current slice
+/// (possibly empty) plus loading:true while the background job runs, and an
+/// optional retryAfterMs hint when the 45s nav gate is hot. Offline-safe:
+/// allows 200 or 429/502 like the shape test.
+#[test]
+fn videos_first_request_is_instant_with_loading_flag() {
+    let srv = TestServer::spawn();
+    let started = std::time::Instant::now();
+    let r = client()
+        .get(format!("{}/api/videos?sub=videos&limit=5", srv.base))
+        .send()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let status = r.status().as_u16();
+    let body: serde_json::Value = r.json().unwrap();
+    if status == 200 {
+        assert!(
+            body.get("loading").and_then(|l| l.as_bool()).is_some(),
+            "loading must be bool, got {body}"
+        );
+        assert!(
+            body.get("cached").and_then(|c| c.as_bool()).is_some(),
+            "cached must be bool, got {body}"
+        );
+        assert!(
+            body.get("stale").and_then(|s| s.as_bool()).is_some(),
+            "stale must be bool, got {body}"
+        );
+        if let Some(ms) = body.get("retryAfterMs") {
+            assert!(ms.is_null() || ms.is_number(), "retryAfterMs must be null|number, got {body}");
+        }
+        // Instant: must not block on a 45s nav gate / browser dwell.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "switch blocked {elapsed:?}; must serve stale/loading immediately, got {body}"
+        );
+    } else {
+        assert!(
+            [429, 502].contains(&status),
+            "expected 200 instant slice or 429/502, got {status}: {body}"
+        );
+    }
+}
+
+/// `after` stays an opaque index cursor: numeric, empty, and legacy t3_*
+// values all keep the 200 shape. Offline-safe (200 or 429/502).
+#[test]
+fn videos_after_cursor_paging_keeps_shape() {
+    let srv = TestServer::spawn();
+    for after in ["", "0", "2", "t3_abc123"] {
+        let r = client()
+            .get(format!(
+                "{}/api/videos?sub=videos&limit=5&after={after}",
+                srv.base
+            ))
+            .send()
+            .unwrap();
+        let status = r.status().as_u16();
+        let body: serde_json::Value = r.json().unwrap();
+        if status == 200 {
+            assert!(
+                body.get("videos").and_then(|v| v.as_array()).is_some(),
+                "expected videos[] array, got {body}"
+            );
+            if let Some(a) = body.get("after") {
+                assert!(a.is_null() || a.is_string(), "after must be string|null, got {body}");
+            }
+            assert!(
+                body.get("hasMore").and_then(|h| h.as_bool()).is_some(),
+                "hasMore must be bool, got {body}"
+            );
+            assert!(
+                body.get("loading").and_then(|l| l.as_bool()).is_some(),
+                "loading must be bool, got {body}"
+            );
+        } else {
+            assert!(
+                [429, 502].contains(&status),
+                "expected 200 or 429/502, got {status}: {body}"
+            );
+        }
+    }
+}
+
+/// No-duplicate merge across pages: page 2 (via the `after` index cursor)
+/// must not repeat youtubeIds from page 1. Offline-safe: skips when either
+/// page is empty (cold cache returns loading:true with []).
+#[test]
+fn videos_pages_have_no_duplicate_youtube_ids() {
+    let srv = TestServer::spawn();
+    let get = |url: String| -> Option<serde_json::Value> {
+        let r = client().get(&url).send().unwrap();
+        if r.status() != 200 {
+            return None;
+        }
+        Some(r.json().unwrap())
+    };
+    let p1 = match get(format!("{}/api/videos?sub=videos&limit=10", srv.base)) {
+        Some(b) => b,
+        None => return,
+    };
+    let after = p1.get("after").and_then(|a| a.as_str()).unwrap_or("");
+    if after.is_empty() {
+        return; // tail or cold cache: nothing to compare
+    }
+    let p2 = match get(format!(
+        "{}/api/videos?sub=videos&limit=10&after={after}",
+        srv.base
+    )) {
+        Some(b) => b,
+        None => return,
+    };
+    let ids = |b: &serde_json::Value| -> Vec<String> {
+        b.get("videos")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.get("youtubeId").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let a = ids(&p1);
+    let b = ids(&p2);
+    if a.is_empty() || b.is_empty() {
+        return; // cold/loading cache: vacuous pass
+    }
+    let set: std::collections::HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    for id in &b {
+        assert!(!set.contains(id.as_str()), "duplicate youtubeId {id} across pages");
+    }
+}
+
 /// Offline-tolerant shape test: accepts either a 200 feed payload or an
 /// upstream-failure payload (sandbox blocks Reddit with 403/429 -> 502/429).
 /// Asserts JSON types either way so `cargo test` passes offline.
@@ -290,8 +424,8 @@ fn refresh_endpoint_offline_safe() {
             Some("videos"),
             "expected sub echo, got {body}"
         );
-        // First fetch on an empty timeline blocks like GET (no videos key);
-        // a queued refresh returns the snapshot fields.
+        // First fetch on an empty timeline is non-blocking: queued snapshot
+        // with loading:true (background job fills the timeline).
         if body.get("queued").is_some() {
             assert!(
                 body.get("cached").and_then(|c| c.as_bool()).is_some(),
@@ -300,6 +434,10 @@ fn refresh_endpoint_offline_safe() {
             assert!(
                 body.get("stale").and_then(|s| s.as_bool()).is_some(),
                 "stale must be bool, got {body}"
+            );
+            assert!(
+                body.get("loading").and_then(|l| l.as_bool()).is_some(),
+                "loading must be bool, got {body}"
             );
             if let Some(f) = body.get("fetchedAt") {
                 assert!(f.is_null() || f.is_number(), "fetchedAt must be null|number, got {body}");
@@ -330,29 +468,36 @@ fn refresh_endpoint_offline_safe() {
 }
 
 /// Live check: hits real Reddit through the local server. Requires network.
+/// Non-blocking API: the first GET queues a background fetch and returns
+/// loading:true, so this polls until videos arrive (up to ~90s).
 /// Run with: `cargo test -- --ignored`
 #[test]
 #[ignore]
 fn live_reddit_videos_returns_rows() {
     let srv = TestServer::spawn();
-    let r = client()
-        .get(format!("{}/api/videos?sub=videos&limit=5", srv.base))
-        .send()
-        .unwrap();
-    let status = r.status();
-    let body: serde_json::Value = r.json().unwrap();
-    assert_eq!(
-        status,
-        200,
-        "live upstream request failed (sandbox may block Reddit 403/429): {body}"
-    );
-    let videos = body
-        .get("videos")
-        .and_then(|v| v.as_array())
-        .expect("expected videos[] array");
-    assert!(
-        !videos.is_empty(),
-        "live feed returned zero rows: {body}"
-    );
-    println!("live feed ok: {} rows, after={}", videos.len(), body.get("after").unwrap_or(&serde_json::Value::Null));
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let r = client()
+            .get(format!("{}/api/videos?sub=videos&limit=5", srv.base))
+            .send()
+            .unwrap();
+        let status = r.status();
+        let body: serde_json::Value = r.json().unwrap();
+        let count = body
+            .get("videos")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if status == 200 && count > 0 {
+            println!("live feed ok: {} rows, after={}", count, body.get("after").unwrap_or(&serde_json::Value::Null));
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "live upstream request failed (sandbox may block Reddit 403/429): status={status} {body}"
+            );
+        }
+        eprintln!("live poll: status={status} rows={count} loading={} — retrying…", body.get("loading").unwrap_or(&serde_json::Value::Null));
+        std::thread::sleep(Duration::from_secs(3));
+    }
 }
