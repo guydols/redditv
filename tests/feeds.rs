@@ -40,6 +40,8 @@ impl TestServer {
         let port = free_port();
         let mut child = Command::new(bin_path())
             .env("PORT", port.to_string())
+            // Stealth browser stays off in tests: API-only (serve stale/error).
+            .env("CHROME_DISABLED", "1")
             // Avoid picking up developer OAuth creds during offline tests.
             .env_remove("REDDIT_CLIENT_ID")
             .env_remove("REDDIT_CLIENT_SECRET")
@@ -200,6 +202,18 @@ fn videos_shape_allows_empty_but_asserts_types() {
             body.get("hasMore").and_then(|h| h.as_bool()).is_some(),
             "hasMore must be bool, got {body}"
         );
+        // Timeline cache fields.
+        assert!(
+            body.get("cached").and_then(|c| c.as_bool()).is_some(),
+            "cached must be bool, got {body}"
+        );
+        assert!(
+            body.get("stale").and_then(|s| s.as_bool()).is_some(),
+            "stale must be bool, got {body}"
+        );
+        if let Some(f) = body.get("fetchedAt") {
+            assert!(f.is_null() || f.is_number(), "fetchedAt must be null|number, got {body}");
+        }
     } else {
         // Offline/sandbox path: upstream blocked -> JSON error envelope.
         assert!(
@@ -212,11 +226,107 @@ fn videos_shape_allows_empty_but_asserts_types() {
             .and_then(|c| c.as_str())
             .unwrap_or("");
         assert!(
-            ["UPSTREAM_403", "UPSTREAM_429", "UPSTREAM_5xx"].contains(&code),
+            ["UPSTREAM_403", "UPSTREAM_429", "UPSTREAM_5xx", "UPSTREAM_BLOCKED", "RATE_LIMITED"].contains(&code),
             "expected upstream error code, got {body}"
         );
         eprintln!("offline-tolerant: upstream unreachable (status {status}, code {code})");
     }
+}
+
+/// The `refresh` query param is accepted and keeps the same response shape.
+/// Offline-safe: allows 200 or 429/502 like the shape test above.
+#[test]
+fn videos_refresh_param_keeps_shape() {
+    let srv = TestServer::spawn();
+    for refresh in ["false", "true"] {
+        let r = client()
+            .get(format!(
+                "{}/api/videos?sub=videos&limit=5&refresh={refresh}",
+                srv.base
+            ))
+            .send()
+            .unwrap();
+        let status = r.status().as_u16();
+        let body: serde_json::Value = r.json().unwrap();
+        if status == 200 {
+            assert!(
+                body.get("cached").and_then(|c| c.as_bool()).is_some(),
+                "cached must be bool, got {body}"
+            );
+            assert!(
+                body.get("stale").and_then(|s| s.as_bool()).is_some(),
+                "stale must be bool, got {body}"
+            );
+            if let Some(f) = body.get("fetchedAt") {
+                assert!(f.is_null() || f.is_number(), "fetchedAt must be null|number, got {body}");
+            }
+        } else {
+            assert!(
+                [429, 502].contains(&status),
+                "expected 200 or 429/502, got {status}: {body}"
+            );
+            assert!(
+                body.get("error").and_then(|e| e.get("code")).is_some(),
+                "expected error envelope, got {body}"
+            );
+        }
+    }
+}
+
+/// POST /api/refresh triggers a force refresh under the same limiter.
+/// Offline-safe: 200 snapshot or 429/502 error envelope.
+#[test]
+fn refresh_endpoint_offline_safe() {
+    let srv = TestServer::spawn();
+    let r = client()
+        .post(format!("{}/api/refresh?sub=videos", srv.base))
+        .send()
+        .unwrap();
+    let status = r.status().as_u16();
+    let body: serde_json::Value = r.json().unwrap();
+    if status == 200 {
+        assert_eq!(
+            body.get("sub").and_then(|s| s.as_str()),
+            Some("videos"),
+            "expected sub echo, got {body}"
+        );
+        // First fetch on an empty timeline blocks like GET (no videos key);
+        // a queued refresh returns the snapshot fields.
+        if body.get("queued").is_some() {
+            assert!(
+                body.get("cached").and_then(|c| c.as_bool()).is_some(),
+                "cached must be bool, got {body}"
+            );
+            assert!(
+                body.get("stale").and_then(|s| s.as_bool()).is_some(),
+                "stale must be bool, got {body}"
+            );
+            if let Some(f) = body.get("fetchedAt") {
+                assert!(f.is_null() || f.is_number(), "fetchedAt must be null|number, got {body}");
+            }
+        } else {
+            // Blocking first-fetch path: same shape as GET /api/videos.
+            assert!(
+                body.get("videos").and_then(|v| v.as_array()).is_some(),
+                "expected videos[] array, got {body}"
+            );
+        }
+    } else {
+        assert!(
+            [400, 429, 502].contains(&status),
+            "expected 200/400/429/502, got {status}: {body}"
+        );
+        assert!(
+            body.get("error").and_then(|e| e.get("code")).is_some(),
+            "expected error envelope, got {body}"
+        );
+    }
+    // Bad sub still 400.
+    let r = client()
+        .post(format!("{}/api/refresh?sub=bad%20sub!", srv.base))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 400);
 }
 
 /// Live check: hits real Reddit through the local server. Requires network.

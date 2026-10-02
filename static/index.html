@@ -235,6 +235,8 @@
             <div class="video-title" id="videoTitle">
                 <span class="video-title-text">Select a video to start</span>
             </div>
+            <button id="refreshBtn" title="Force a fresh fetch">Refresh</button>
+            <span id="freshBadge" title="">Loading…</span>
         </header>
 
         <div class="video-container">
@@ -309,9 +311,12 @@
                 return null;
             }
 
-            async function fetchVideosPage(subreddit, after) {
+            async function fetchVideosPage(subreddit, after, refresh) {
                 const params = new URLSearchParams({ sub: subreddit, limit: "25" });
                 if (after) params.set("after", after);
+                // Only the Refresh button passes refresh=true; infinite
+                // scroll and sub switches always use refresh=false (cache).
+                params.set("refresh", refresh ? "true" : "false");
                 const response = await fetch(`/api/videos?${params.toString()}`);
                 const data = await response.json();
                 if (!response.ok) {
@@ -321,7 +326,22 @@
                             : `Request failed (${response.status})`;
                     throw new Error(msg);
                 }
+                updateFreshBadge(data);
                 return data;
+            }
+
+            function updateFreshBadge(data) {
+                const badge = document.getElementById("freshBadge");
+                if (!badge) return;
+                const stale = !!data.stale;
+                const when = data.fetchedAt
+                    ? new Date(data.fetchedAt).toLocaleTimeString()
+                    : "never";
+                badge.textContent = stale ? `Stale (fetched ${when})` : `Fresh (fetched ${when})`;
+                badge.dataset.state = stale ? "stale" : "fresh";
+                badge.title = data.cached
+                    ? "Served from the 1h server cache"
+                    : "Fresh fetch";
             }
 
             function mapBackendVideo(v) {
@@ -344,7 +364,7 @@
                 playlist.innerHTML =
                     '<div class="loading">Loading videos...</div>';
                 try {
-                    const data = await fetchVideosPage(subreddit, null);
+                    const data = await fetchVideosPage(subreddit, null, false);
                     videos = (data.videos || []).map(mapBackendVideo);
                     afterCursor = data.after || null;
                     hasMore = !!data.hasMore;
@@ -364,7 +384,7 @@
                 if (loading || !hasMore) return;
                 loading = true;
                 try {
-                    const data = await fetchVideosPage(currentSub, afterCursor);
+                    const data = await fetchVideosPage(currentSub, afterCursor, false);
                     const more = (data.videos || []).map(mapBackendVideo);
                     videos = videos.concat(more);
                     afterCursor = data.after || null;
@@ -573,6 +593,36 @@
             subredditSelect.addEventListener("change", (e) => {
                 fetchSubreddit(e.target.value);
             });
+
+            // Explicit force-refresh: the only path that sends refresh=true.
+            document
+                .getElementById("refreshBtn")
+                .addEventListener("click", async () => {
+                    const btn = document.getElementById("refreshBtn");
+                    btn.disabled = true;
+                    playlist.innerHTML =
+                        '<div class="loading">Refreshing…</div>';
+                    try {
+                        const data = await fetchVideosPage(
+                            currentSub,
+                            null,
+                            true,
+                        );
+                        videos = (data.videos || []).map(mapBackendVideo);
+                        afterCursor = data.after || null;
+                        hasMore = !!data.hasMore;
+                        currentIndex = 0;
+                        renderPlaylist();
+                        observeSentinel();
+                        if (videos.length > 0) playVideo(0);
+                    } catch (error) {
+                        console.error("Error refreshing:", error);
+                        playlist.innerHTML =
+                            '<div class="loading">Error refreshing. Try again later.</div>';
+                    } finally {
+                        btn.disabled = false;
+                    }
+                });
 
             // Initial load - wait for YouTube API
             function initPlayer() {

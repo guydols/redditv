@@ -3,14 +3,23 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-use moka::future::Cache;
+use chromiumoxide::{Browser, BrowserConfig};
+use dashmap::DashMap;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{Mutex, RwLock};
 use tower_http::services::{ServeDir, ServeFile};
 
 const DEFAULT_UA: &str = "linux:redditv:0.1.0 (by /u/redditv-dev)";
+/// Pinned desktop Chrome UA used for the headless browser.
+const CHROME_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const DEFAULT_SUBS: &[&str] = &[
     "videos",
     "ArtisanVideos",
@@ -33,10 +42,42 @@ const DEFAULT_SUBS: &[&str] = &[
 const PLACEHOLDER_THUMB: &str =
     "https://via.placeholder.com/200x112/333/666?text=No+Thumbnail";
 
+/// Timeline TTL: slices are served from memory for 1h.
+const TTL_MS: i64 = 3_600_000;
+/// Max posts kept per sub timeline, newest-first.
+const MAX_POSTS: usize = 300;
+/// Minimum gap between two browser navigations (+ jitter 0-15s).
+const MIN_NAV_GAP: Duration = Duration::from_secs(45);
+/// Sliding-window cap on browser navigations per hour.
+const MAX_NAVS_PER_HOUR: usize = 35;
+/// Backoff for a sub after a block/challenge was detected (~3h, within 2-4h).
+const BLOCKED_BACKOFF_MS: i64 = 3 * 3_600_000;
+
+// ---------- state ----------
+
 #[derive(Clone)]
 struct AppState {
     client: reqwest::Client,
-    cache: Cache<String, serde_json::Value>,
+    timelines: Arc<DashMap<String, Arc<RwLock<SubTimeline>>>>,
+    inflight: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    nav_gate: Arc<Mutex<NavGate>>,
+}
+
+#[derive(Default)]
+struct SubTimeline {
+    posts: Vec<VideoItem>,
+    /// Epoch ms of last successful fetch; None = never fetched.
+    fetched_at_ms: Option<i64>,
+    last_error: Option<String>,
+    /// Epoch ms until which this sub is backed off (after BLOCKED).
+    blocked_until_ms: Option<i64>,
+}
+
+#[derive(Default)]
+struct NavGate {
+    last_nav: Option<Instant>,
+    /// Timestamps of recent navigations (sliding 1h window).
+    nav_times: VecDeque<Instant>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,9 +85,15 @@ struct VideosQuery {
     sub: Option<String>,
     limit: Option<String>,
     after: Option<String>,
+    refresh: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize)]
+struct RefreshQuery {
+    sub: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct VideoItem {
     #[serde(rename = "youtubeId")]
     youtube_id: String,
@@ -60,10 +107,50 @@ struct VideoItem {
     created_utc: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ScrapedRow {
+    #[serde(rename = "youtubeId", default)]
+    youtube_id: String,
+    #[serde(rename = "youtubeUrl", default)]
+    youtube_url: String,
+    #[serde(default)]
+    title: String,
+    #[serde(rename = "redditUrl", default)]
+    reddit_url: String,
+    #[serde(default)]
+    thumbnail: String,
+    #[serde(rename = "createdUtc", default)]
+    created_utc: Option<i64>,
+}
+
 // ---------- helpers ----------
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 0-15s jitter in ms derived from current time (no extra deps).
+fn jitter_15s_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 15_000) as u64)
+        .unwrap_or(0)
+}
 
 fn reddit_ua() -> String {
     std::env::var("REDDIT_UA").unwrap_or_else(|_| DEFAULT_UA.to_string())
+}
+
+/// When set (e.g. `CHROME_DISABLED=1` in CI/tests), never launch the browser;
+/// serve from memory + reqwest fallback only.
+fn chrome_disabled() -> bool {
+    match std::env::var("CHROME_DISABLED") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
 }
 
 fn is_valid_sub(sub: &str) -> bool {
@@ -99,6 +186,16 @@ fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|secs| secs.saturating_mul(1000))
+}
+
+/// Opaque index cursor into the in-memory timeline. Legacy `t3_*` cursors are
+/// accepted but restart at index 0 (no reddit-page mapping server-side).
+fn parse_after(after: &Option<String>) -> usize {
+    match after {
+        None => 0,
+        Some(s) if s.is_empty() => 0,
+        Some(s) => s.parse::<usize>().unwrap_or(0),
+    }
 }
 
 /// Extract a YouTube video id from a URL. Supports watch?v=, youtu.be/, /shorts/, /embed/.
@@ -167,6 +264,13 @@ fn extract_youtube_from_text(haystack: &str) -> Option<(String, String)> {
 
 fn clean_url(u: &str) -> String {
     u.replace("&amp;", "&")
+}
+
+fn dedupe_cap(mut items: Vec<VideoItem>) -> Vec<VideoItem> {
+    let mut seen: HashSet<String> = HashSet::new();
+    items.retain(|v| seen.insert(v.youtube_id.clone()));
+    items.truncate(MAX_POSTS);
+    items
 }
 
 // ---------- reddit JSON types ----------
@@ -273,7 +377,7 @@ fn videos_from_listing(listing: &RedditListing) -> (Vec<VideoItem>, Option<Strin
     (out, listing.data.after.clone())
 }
 
-// ---------- fetch paths ----------
+// ---------- fetch paths (reqwest fallback; kept when browser disabled/fails) ----------
 
 async fn fetch_public_json(
     client: &reqwest::Client,
@@ -551,6 +655,531 @@ async fn fetch_rss_fallback(
     Ok(out)
 }
 
+/// Reqwest JSON -> OAuth -> RSS fallback chain. Returns timeline posts
+/// (newest-first) on success.
+async fn fetch_http_fallback(
+    client: &reqwest::Client,
+    sub: &str,
+) -> Result<Vec<VideoItem>, (StatusCode, String, Option<u64>)> {
+    let ua = reddit_ua();
+    // Timeline fill always grabs the newest page; pagination is served
+    // from memory via the index cursor.
+    const FILL_LIMIT: u32 = 100;
+    match fetch_public_json(client, &ua, sub, FILL_LIMIT, None).await {
+        Ok((videos, _)) => return Ok(dedupe_cap(videos)),
+        Err((code, msg, retry_ms)) => {
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                return Err((code, msg, retry_ms));
+            }
+            if code != StatusCode::BAD_GATEWAY {
+                return Err((code, msg, retry_ms));
+            }
+            if let Some(oauth_result) =
+                fetch_oauth_json(client, &ua, sub, FILL_LIMIT, None).await
+            {
+                match oauth_result {
+                    Ok((videos, _)) => return Ok(dedupe_cap(videos)),
+                    Err((c2, m2, r2)) => {
+                        if c2 == StatusCode::TOO_MANY_REQUESTS {
+                            return Err((c2, m2, r2));
+                        }
+                    }
+                }
+            }
+            match fetch_rss_fallback(client, &ua, sub).await {
+                Ok(all) => Ok(dedupe_cap(all)),
+                Err((c3, m3, r3)) => {
+                    if c3 == StatusCode::TOO_MANY_REQUESTS {
+                        return Err((c3, "Reddit rate-limited the request".to_string(), r3));
+                    }
+                    if msg.contains("403") || m3.contains("403") {
+                        return Err((
+                            StatusCode::BAD_GATEWAY,
+                            format!("Reddit upstream denied the request. {}", m3),
+                            r3,
+                        ));
+                    }
+                    Err((
+                        StatusCode::BAD_GATEWAY,
+                        format!("Reddit upstream failed ({}; fallback: {})", msg, m3),
+                        r3,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+// ---------- stealth headless browser (chromiumoxide) ----------
+
+/// Single long-lived browser, lazily started on the first cache miss.
+static BROWSER_CELL: OnceLock<Arc<Mutex<Option<Browser>>>> = OnceLock::new();
+
+fn browser_cell() -> Arc<Mutex<Option<Browser>>> {
+    BROWSER_CELL
+        .get_or_init(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
+
+async fn launch_browser() -> Result<Browser, String> {
+    let config = BrowserConfig::builder()
+        .user_data_dir("./data/chrome-profile")
+        .window_size(1920, 1080)
+        .new_headless_mode()
+        .arg("--disable-blink-features=AutomationControlled")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-dev-shm-usage")
+        .arg("--window-size=1920,1080")
+        // NOTE: request interception is intentionally NOT enabled: without a
+        // handler continuing every paused request, navigation would stall.
+        .build()
+        .map_err(|e| format!("browser config failed: {}", e))?;
+    let (browser, mut handler) = Browser::launch(config)
+        .await
+        .map_err(|e| format!("browser launch failed: {}", e))?;
+    // Drive the connection in the background.
+    tokio::spawn(async move {
+        while handler.next().await.is_some() {}
+    });
+    Ok(browser)
+}
+
+const EXTRACT_JS: &str = r#"(() => {
+  const out = [];
+  const seen = new Set();
+  const idOf = (u) => {
+    if (!u) return null;
+    let m = u.match(/youtu\.be\/([A-Za-z0-9_-]{5,11})/);
+    if (m) return m[1];
+    m = u.match(/youtube\.com\/shorts\/([A-Za-z0-9_-]{5,11})/);
+    if (m) return m[1];
+    m = u.match(/youtube\.com\/embed\/([A-Za-z0-9_-]{5,11})/);
+    if (m) return m[1];
+    m = u.match(/[?&]v=([A-Za-z0-9_-]{5,11})/);
+    if (m) return m[1];
+    return null;
+  };
+  const anchors = document.querySelectorAll('a[href]');
+  for (const a of anchors) {
+    const href = a.getAttribute('href') || '';
+    if (href.indexOf('youtube.com') === -1 && href.indexOf('youtu.be') === -1) continue;
+    const id = idOf(href);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    let title = (a.getAttribute('title') || (a.textContent || '')).trim();
+    const root = a.closest('[data-permalink], .thing, shreddit-post, [data-testid="post-container"]');
+    let permalink = null;
+    if (root) {
+      permalink = root.getAttribute('data-permalink') || root.getAttribute('permalink');
+      if (!permalink) {
+        const c = root.querySelector('a[href*="/comments/"]');
+        if (c) permalink = c.getAttribute('href');
+      }
+      if (!title) {
+        const t = root.querySelector('a.title, [data-testid="post-title"], h3, h2');
+        if (t) title = ((t.textContent || '')).trim();
+      }
+    }
+    if (permalink && permalink.charAt(0) === '/') permalink = 'https://www.reddit.com' + permalink;
+    let thumbnail = null;
+    if (root) {
+      const img = root.querySelector('img[src^="http"]');
+      if (img) thumbnail = img.getAttribute('src');
+    }
+    out.push({ youtubeId: id, youtubeUrl: href, title: title || 'Untitled',
+               redditUrl: permalink || '', thumbnail: thumbnail || '', createdUtc: null });
+    if (out.length >= 300) break;
+  }
+  return out;
+})()"#;
+
+/// Scrape one sub's newest posts via the shared headless browser.
+/// Holds the browser lock for the whole scrape (global serialization).
+/// Returns Err with "BLOCKED: ..." prefix when a selector timeout or
+/// challenge page suggests bot detection.
+async fn scrape_sub_via_browser(sub: &str) -> Result<Vec<VideoItem>, String> {
+    if chrome_disabled() {
+        return Err("CHROME_DISABLED".to_string());
+    }
+    let cell = browser_cell();
+    let mut guard = cell.lock().await;
+    if guard.is_none() {
+        match launch_browser().await {
+            Ok(b) => *guard = Some(b),
+            Err(e) => return Err(e),
+        }
+    }
+    let browser = guard.as_ref().expect("browser just launched");
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .map_err(|e| format!("new page failed: {}", e))?;
+    let result: Result<Vec<VideoItem>, String> = async {
+        page.enable_stealth_mode_with_agent(CHROME_UA)
+            .await
+            .map_err(|e| format!("stealth mode failed: {}", e))?;
+        // Belt-and-braces webdriver hiding (stealth mode already covers this).
+        let _ = page
+            .evaluate_on_new_document(
+                "Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', { get: () => undefined });",
+            )
+            .await;
+        // old.reddit first (lighter), then www fallback.
+        let urls = [
+            format!("https://old.reddit.com/r/{}/new/", sub),
+            format!("https://www.reddit.com/r/{}/new/", sub),
+        ];
+        let mut nav_ok = false;
+        let mut last_err = String::from("no navigation attempted");
+        for u in &urls {
+            match tokio::time::timeout(Duration::from_secs(45), page.goto(u.as_str())).await
+            {
+                Ok(Ok(_)) => {
+                    nav_ok = true;
+                    break;
+                }
+                Ok(Err(e)) => last_err = e.to_string(),
+                Err(_) => last_err = "navigation timeout".to_string(),
+            }
+        }
+        if !nav_ok {
+            return Err(format!("navigation failed: {}", last_err));
+        }
+        // Wait for post content; a timeout here usually means a challenge/block.
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            page.find_element("a.title, shreddit-post"),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(format!("BLOCKED: selector not found: {}", e)),
+            Err(_) => return Err("BLOCKED: selector timeout (possible challenge)".to_string()),
+        }
+        // Human-ish dwell: 2-6s + jitter.
+        let dwell = 2000 + (now_ms() as u64 % 4000) + jitter_15s_ms() % 1000;
+        tokio::time::sleep(Duration::from_millis(dwell)).await;
+        // One scroll to the bottom to trigger lazy content.
+        let _ = page
+            .evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let rows: Vec<ScrapedRow> = page
+            .evaluate(EXTRACT_JS)
+            .await
+            .map_err(|e| format!("extract failed: {}", e))?
+            .into_value()
+            .map_err(|e| format!("extract decode failed: {}", e))?;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<VideoItem> = Vec::new();
+        for r in rows {
+            if r.youtube_id.is_empty() || !seen.insert(r.youtube_id.clone()) {
+                continue;
+            }
+            let thumbnail = if r.thumbnail.starts_with("http") {
+                clean_url(&r.thumbnail)
+            } else {
+                PLACEHOLDER_THUMB.to_string()
+            };
+            out.push(VideoItem {
+                youtube_id: r.youtube_id,
+                youtube_url: clean_url(&r.youtube_url),
+                title: if r.title.is_empty() {
+                    "Untitled".to_string()
+                } else {
+                    r.title
+                },
+                reddit_url: r.reddit_url,
+                thumbnail,
+                created_utc: r.created_utc,
+            });
+            if out.len() >= MAX_POSTS {
+                break;
+            }
+        }
+        Ok(out)
+    }
+    .await;
+    let _ = page.close().await;
+    result
+}
+
+// ---------- rate limiting ----------
+
+/// Check + record a navigation slot. Err(retry_after_ms) when the
+/// per-sub... global limits are hit (MIN_NAV_GAP or hourly cap).
+fn nav_gate_reserve(gate: &mut NavGate) -> Result<(), u64> {
+    let now = Instant::now();
+    while gate
+        .nav_times
+        .front()
+        .map(|t| now.duration_since(*t) > Duration::from_secs(3600))
+        .unwrap_or(false)
+    {
+        gate.nav_times.pop_front();
+    }
+    if gate.nav_times.len() >= MAX_NAVS_PER_HOUR {
+        let oldest = gate.nav_times.front().cloned().unwrap_or(now);
+        let retry = Duration::from_secs(3600)
+            .checked_sub(now.duration_since(oldest))
+            .unwrap_or(Duration::from_secs(60));
+        return Err(retry.as_millis() as u64);
+    }
+    if let Some(last) = gate.last_nav {
+        let elapsed = now.duration_since(last);
+        if elapsed < MIN_NAV_GAP {
+            let wait = (MIN_NAV_GAP - elapsed).as_millis() as u64 + jitter_15s_ms();
+            return Err(wait);
+        }
+    }
+    gate.last_nav = Some(now);
+    gate.nav_times.push_back(now);
+    Ok(())
+}
+
+/// Peek without recording (used by POST /api/refresh; the spawned task
+/// records when it actually navigates).
+fn nav_gate_peek(gate: &mut NavGate) -> Result<(), u64> {
+    let now = Instant::now();
+    while gate
+        .nav_times
+        .front()
+        .map(|t| now.duration_since(*t) > Duration::from_secs(3600))
+        .unwrap_or(false)
+    {
+        gate.nav_times.pop_front();
+    }
+    if gate.nav_times.len() >= MAX_NAVS_PER_HOUR {
+        let oldest = gate.nav_times.front().cloned().unwrap_or(now);
+        let retry = Duration::from_secs(3600)
+            .checked_sub(now.duration_since(oldest))
+            .unwrap_or(Duration::from_secs(60));
+        return Err(retry.as_millis() as u64);
+    }
+    if let Some(last) = gate.last_nav {
+        let elapsed = now.duration_since(last);
+        if elapsed < MIN_NAV_GAP {
+            let wait = (MIN_NAV_GAP - elapsed).as_millis() as u64 + jitter_15s_ms();
+            return Err(wait);
+        }
+    }
+    Ok(())
+}
+
+// ---------- timeline helpers ----------
+
+fn timeline_arc(state: &AppState, sub: &str) -> Arc<RwLock<SubTimeline>> {
+    state
+        .timelines
+        .entry(sub.to_string())
+        .or_insert_with(|| Arc::new(RwLock::new(SubTimeline::default())))
+        .clone()
+}
+
+fn inflight_lock(state: &AppState, sub: &str) -> Arc<Mutex<()>> {
+    state
+        .inflight
+        .entry(sub.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn slice_body(
+    sub: &str,
+    tl: &SubTimeline,
+    start: usize,
+    limit: usize,
+    cached: bool,
+) -> serde_json::Value {
+    let now = now_ms();
+    let stale = tl
+        .fetched_at_ms
+        .map(|f| now - f > TTL_MS)
+        .unwrap_or(true);
+    let start = start.min(tl.posts.len());
+    let end = (start + limit).min(tl.posts.len());
+    let videos = &tl.posts[start..end];
+    let next_after = if end < tl.posts.len() {
+        Some(end.to_string())
+    } else {
+        None
+    };
+    let has_more = end < tl.posts.len();
+    serde_json::json!({
+        "sub": sub,
+        "videos": videos,
+        "after": next_after,
+        "hasMore": has_more,
+        "cached": cached,
+        "fetchedAt": tl.fetched_at_ms,
+        "stale": stale,
+    })
+}
+
+/// Store fresh posts in the timeline.
+async fn store_posts(tl: &Arc<RwLock<SubTimeline>>, posts: Vec<VideoItem>) {
+    let mut w = tl.write().await;
+    w.posts = posts;
+    w.fetched_at_ms = Some(now_ms());
+    w.last_error = None;
+    w.blocked_until_ms = None;
+}
+
+async fn mark_blocked(tl: &Arc<RwLock<SubTimeline>>, reason: String) {
+    let mut w = tl.write().await;
+    w.last_error = Some("BLOCKED".to_string());
+    w.blocked_until_ms = Some(now_ms() + BLOCKED_BACKOFF_MS);
+    let _ = reason;
+}
+
+/// Blocking fetch for a sub with no usable timeline data.
+/// Order: browser scrape -> reqwest fallback chain -> 502.
+/// Only called when the sub was never successfully fetched.
+async fn blocking_fetch(state: &AppState, sub: &str) -> Response {
+    let tl = timeline_arc(state, sub);
+    // Respect block backoff even when never fetched.
+    {
+        let r = tl.read().await;
+        if let Some(until) = r.blocked_until_ms {
+            if now_ms() < until {
+                return error_json(
+                    StatusCode::BAD_GATEWAY,
+                    "UPSTREAM_BLOCKED",
+                    format!("Reddit blocked automated access to r/{} (backoff); try again later", sub),
+                    None,
+                );
+            }
+        }
+    }
+    // Per-sub single-flight.
+    let lock = inflight_lock(state, sub);
+    let Ok(_guard) = lock.try_lock() else {
+        return error_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            format!("r/{} is already being fetched; retry shortly", sub),
+            Some(10_000),
+        );
+    };
+    // Global navigation throttle.
+    {
+        let mut gate = state.nav_gate.lock().await;
+        if let Err(retry_ms) = nav_gate_reserve(&mut gate) {
+            return error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "browser navigation budget exhausted; retry later".to_string(),
+                Some(retry_ms),
+            );
+        }
+    }
+    // 1) Stealth browser (skipped when CHROME_DISABLED=1).
+    if !chrome_disabled() {
+        match scrape_sub_via_browser(sub).await {
+            Ok(posts) => {
+                let posts = dedupe_cap(posts);
+                store_posts(&tl, posts).await;
+                let r = tl.read().await;
+                // Fresh fill: serve from index 0 with default page size below;
+                // the caller re-slices, so return the full first page generically.
+                return (StatusCode::OK, Json(slice_body(sub, &r, 0, usize::MAX, false)))
+                    .into_response();
+            }
+            Err(e) => {
+                if e.contains("BLOCKED") {
+                    mark_blocked(&tl, e).await;
+                } else {
+                    let mut w = tl.write().await;
+                    w.last_error = Some(e);
+                }
+                // fall through to reqwest fallback
+            }
+        }
+    }
+    // 2) Reqwest JSON/OAuth/RSS fallback (also the CHROME_DISABLED path).
+    match fetch_http_fallback(&state.client, sub).await {
+        Ok(posts) => {
+            store_posts(&tl, posts).await;
+            let r = tl.read().await;
+            (StatusCode::OK, Json(slice_body(sub, &r, 0, usize::MAX, false))).into_response()
+        }
+        Err((code, msg, retry_ms)) => {
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                return error_json(code, "UPSTREAM_429", msg, retry_ms);
+            }
+            if msg.contains("403") {
+                return error_json(
+                    StatusCode::BAD_GATEWAY,
+                    "UPSTREAM_BLOCKED",
+                    format!("Reddit blocked automated access to r/{}. {}", sub, msg),
+                    retry_ms,
+                );
+            }
+            error_json(
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_BLOCKED",
+                format!("Reddit upstream failed for r/{}: {}", sub, msg),
+                retry_ms,
+            )
+        }
+    }
+}
+
+/// Background refresh: serve-stale trigger. Never blocks a response;
+/// updates the timeline in place on success.
+async fn background_refresh(state: AppState, sub: String) {
+    let tl = timeline_arc(&state, &sub);
+    {
+        let r = tl.read().await;
+        if let Some(until) = r.blocked_until_ms {
+            if now_ms() < until {
+                return;
+            }
+        }
+    }
+    let lock = inflight_lock(&state, &sub);
+    let Ok(_guard) = lock.try_lock() else {
+        return;
+    };
+    {
+        let mut gate = state.nav_gate.lock().await;
+        if nav_gate_reserve(&mut gate).is_err() {
+            return;
+        }
+    }
+    if !chrome_disabled() {
+        match scrape_sub_via_browser(&sub).await {
+            Ok(posts) => {
+                store_posts(&tl, dedupe_cap(posts)).await;
+                return;
+            }
+            Err(e) => {
+                if e.contains("BLOCKED") {
+                    mark_blocked(&tl, e).await;
+                    return;
+                }
+                let mut w = tl.write().await;
+                w.last_error = Some(e);
+            }
+        }
+    }
+    match fetch_http_fallback(&state.client, &sub).await {
+        Ok(posts) => store_posts(&tl, posts).await,
+        Err((code, msg, _)) => {
+            let mut w = tl.write().await;
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                w.last_error = Some("UPSTREAM_429".to_string());
+            } else if msg.contains("403") || msg.contains("BLOCKED") {
+                w.last_error = Some("BLOCKED".to_string());
+                w.blocked_until_ms = Some(now_ms() + BLOCKED_BACKOFF_MS);
+            } else {
+                w.last_error = Some(msg);
+            }
+        }
+    }
+}
+
 // ---------- handlers ----------
 
 async fn healthz() -> impl IntoResponse {
@@ -589,97 +1218,107 @@ async fn videos_handler(
         },
     };
     let after: Option<String> = q.after.filter(|s| !s.is_empty());
+    let start = parse_after(&after);
+    let refresh_req = q.refresh.unwrap_or(false);
 
-    let cache_key = format!("{}:{}:{}", sub, limit, after.as_deref().unwrap_or("first"));
-    if let Some(cached) = state.cache.get(&cache_key).await {
-        return (StatusCode::OK, Json(cached)).into_response();
+    let tl = timeline_arc(&state, &sub);
+    let never_seen = tl.read().await.fetched_at_ms.is_none();
+
+    // Only block on the browser when the sub was never fetched.
+    if never_seen {
+        let resp = blocking_fetch(&state, &sub).await;
+        // blocking_fetch returns the full timeline; re-slice to the
+        // requested page when it succeeded.
+        if resp.status() == StatusCode::OK {
+            let r = tl.read().await;
+            return (
+                StatusCode::OK,
+                Json(slice_body(&sub, &r, start, limit as usize, false)),
+            )
+                .into_response();
+        }
+        return resp;
     }
 
-    let ua = reddit_ua();
-
-    // Primary: public JSON
-    match fetch_public_json(&state.client, &ua, &sub, limit, after.as_deref()).await {
-        Ok((videos, next_after)) => {
-            let body = serde_json::json!({
-                "sub": sub,
-                "videos": videos,
-                "after": next_after.clone(),
-                "hasMore": next_after.is_some(),
-            });
-            state.cache.insert(cache_key, body.clone()).await;
-            return (StatusCode::OK, Json(body)).into_response();
+    // Serve from memory; kick a background refresh when stale or forced.
+    let (body, needs_bg) = {
+        let r = tl.read().await;
+        let now = now_ms();
+        let is_stale = r
+            .fetched_at_ms
+            .map(|f| now - f > TTL_MS)
+            .unwrap_or(true);
+        let mut body = slice_body(&sub, &r, start, limit as usize, true);
+        if refresh_req {
+            // Requested fresh data that is still being fetched: flag stale so
+            // the UI can show a refreshing state.
+            body["stale"] = serde_json::Value::Bool(true);
         }
-        Err((code, msg, retry_ms)) => {
-            // 429: honor Retry-After immediately
-            if code == StatusCode::TOO_MANY_REQUESTS {
-                return error_json(code, "UPSTREAM_429", msg, retry_ms);
-            }
-            // 403 / 5xx / network: try OAuth then RSS fallback
-            let is_fallbackable = code == StatusCode::BAD_GATEWAY;
-            if !is_fallbackable {
-                return error_json(code, "UPSTREAM_5xx", msg, retry_ms);
-            }
-            // Optional OAuth retry
-            if let Some(oauth_result) =
-                fetch_oauth_json(&state.client, &ua, &sub, limit, after.as_deref()).await
-            {
-                match oauth_result {
-                    Ok((videos, next_after)) => {
-                        let body = serde_json::json!({
-                            "sub": sub,
-                            "videos": videos,
-                            "after": next_after.clone(),
-                            "hasMore": next_after.is_some(),
-                        });
-                        state.cache.insert(cache_key, body.clone()).await;
-                        return (StatusCode::OK, Json(body)).into_response();
-                    }
-                    Err((c2, m2, r2)) => {
-                        if c2 == StatusCode::TOO_MANY_REQUESTS {
-                            return error_json(c2, "UPSTREAM_429", m2, r2);
-                        }
-                        // otherwise continue to RSS fallback
-                    }
-                }
-            }
-            // RSS fallback (no pagination cursor; RSS is a single page)
-            match fetch_rss_fallback(&state.client, &ua, &sub).await {
-                Ok(all) => {
-                    // RSS has no `after` cursor; emulate limit client-side and report no more pages.
-                    let videos: Vec<VideoItem> =
-                        all.into_iter().take(limit as usize).collect();
-                    let body = serde_json::json!({
-                        "sub": sub,
-                        "videos": videos,
-                        "after": serde_json::Value::Null,
-                        "hasMore": false,
-                    });
-                    state.cache.insert(cache_key, body.clone()).await;
-                    return (StatusCode::OK, Json(body)).into_response();
-                }
-                Err((c3, m3, r3)) => {
-                    if c3 == StatusCode::TOO_MANY_REQUESTS {
-                        return error_json(c3, "UPSTREAM_429", m3, r3);
-                    }
-                    // Distinguish original 403 vs generic 5xx
-                    if msg.contains("403") || m3.contains("403") {
-                        return error_json(
-                            StatusCode::BAD_GATEWAY,
-                            "UPSTREAM_403",
-                            format!("Reddit upstream denied the request. {}", m3),
-                            r3,
-                        );
-                    }
-                    return error_json(
-                        StatusCode::BAD_GATEWAY,
-                        "UPSTREAM_5xx",
-                        format!("Reddit upstream failed ({}; fallback: {})", msg, m3),
-                        r3,
-                    );
-                }
-            }
+        (body, is_stale || refresh_req)
+    };
+    if needs_bg {
+        let bg_state = state.clone();
+        let bg_sub = sub.clone();
+        tokio::spawn(async move {
+            background_refresh(bg_state, bg_sub).await;
+        });
+    }
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+async fn refresh_handler(
+    State(state): State<AppState>,
+    Query(q): Query<RefreshQuery>,
+) -> Response {
+    let sub = q.sub.unwrap_or_else(|| "videos".to_string());
+    if !is_valid_sub(&sub) {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_SUB",
+            format!("invalid subreddit name: {:?}", sub),
+            None,
+        );
+    }
+    let tl = timeline_arc(&state, &sub);
+    if tl.read().await.fetched_at_ms.is_none() {
+        // Nothing to serve stale: block like a first fetch.
+        return blocking_fetch(&state, &sub).await;
+    }
+    // Same limiter as foreground fetches (peek; the task reserves on nav).
+    {
+        let lock = inflight_lock(&state, &sub);
+        if lock.try_lock().is_err() {
+            return error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                format!("r/{} is already being fetched; retry shortly", sub),
+                Some(10_000),
+            );
+        }
+        let mut gate = state.nav_gate.lock().await;
+        if let Err(retry_ms) = nav_gate_peek(&mut gate) {
+            return error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "browser navigation budget exhausted; retry later".to_string(),
+                Some(retry_ms),
+            );
         }
     }
+    let bg_state = state.clone();
+    let bg_sub = sub.clone();
+    tokio::spawn(async move {
+        background_refresh(bg_state, bg_sub).await;
+    });
+    let r = tl.read().await;
+    let body = serde_json::json!({
+        "sub": sub,
+        "queued": true,
+        "cached": true,
+        "fetchedAt": r.fetched_at_ms,
+        "stale": true,
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 #[tokio::main]
@@ -693,17 +1332,19 @@ async fn main() {
         .timeout(Duration::from_secs(10))
         .build()
         .expect("failed to build http client");
-    let cache: Cache<String, serde_json::Value> = Cache::builder()
-        .max_capacity(1000)
-        .time_to_live(Duration::from_secs(300))
-        .build();
 
-    let state = AppState { client, cache };
+    let state = AppState {
+        client,
+        timelines: Arc::new(DashMap::new()),
+        inflight: Arc::new(DashMap::new()),
+        nav_gate: Arc::new(Mutex::new(NavGate::default())),
+    };
 
     let api = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/subs", get(subs))
-        .route("/api/videos", get(videos_handler));
+        .route("/api/videos", get(videos_handler))
+        .route("/api/refresh", post(refresh_handler));
 
     // Static files with index fallback for SPA-ish root.
     let serve_dir = ServeDir::new("static")
