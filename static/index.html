@@ -261,6 +261,11 @@
             let isYouTube = false;
             let player = null;
             let playerReady = false;
+            let currentSub = "videos";
+            let afterCursor = null;
+            let hasMore = false;
+            let loading = false;
+            let playlistObserver = null;
 
             const videoPlayer = document.getElementById("videoPlayer");
             const youtubePlayer = document.getElementById("youtubePlayer");
@@ -304,169 +309,47 @@
                 return null;
             }
 
-            async function fetchSubredditRSS(subreddit) {
-                const rssUrl = `https://www.reddit.com/r/${subreddit}/new/.rss?limit=100`;
-                const enc = encodeURIComponent(rssUrl);
-
-                let xmlText = null;
-                let lastError = null;
-
-                // 1) cors.lol (keyless) -> raw RSS text
-                try {
-                    const response = await fetch(
-                        `https://api.cors.lol/?url=${enc}`,
-                    );
-                    if (!response.ok) {
-                        throw new Error(
-                            `cors.lol fetch failed with status ${response.status}`,
-                        );
-                    }
-                    const text = await response.text();
-                    if (text && (text.includes("<entry") || text.includes("<feed"))) {
-                        xmlText = text;
-                    } else {
-                        throw new Error(
-                            "cors.lol response did not look like RSS XML",
-                        );
-                    }
-                } catch (error) {
-                    lastError = error;
+            async function fetchVideosPage(subreddit, after) {
+                const params = new URLSearchParams({ sub: subreddit, limit: "25" });
+                if (after) params.set("after", after);
+                const response = await fetch(`/api/videos?${params.toString()}`);
+                const data = await response.json();
+                if (!response.ok) {
+                    const msg =
+                        data && data.error && data.error.message
+                            ? data.error.message
+                            : `Request failed (${response.status})`;
+                    throw new Error(msg);
                 }
+                return data;
+            }
 
-                // 2) allorigins /get -> JSON { contents }
-                if (!xmlText) {
-                    try {
-                        const response = await fetch(
-                            `https://api.allorigins.win/get?url=${enc}`,
-                        );
-                        if (!response.ok) {
-                            throw new Error(
-                                `allorigins /get fetch failed with status ${response.status}`,
-                            );
-                        }
-                        const data = await response.json();
-                        if (
-                            data &&
-                            data.status &&
-                            (data.status.http_code === 403 ||
-                                data.status.http_code === 429)
-                        ) {
-                            throw new Error(
-                                `Reddit upstream returned ${data.status.http_code} (rate-limited/blocked). Try again later.`,
-                            );
-                        }
-                        const contents = data && data.contents;
-                        if (
-                            contents &&
-                            (contents.includes("<entry") ||
-                                contents.includes("<feed"))
-                        ) {
-                            xmlText = contents;
-                        } else {
-                            throw new Error(
-                                "allorigins /get response did not look like RSS XML",
-                            );
-                        }
-                    } catch (error) {
-                        lastError = error;
-                    }
-                }
-
-                // 3) allorigins /raw -> raw RSS text
-                if (!xmlText) {
-                    try {
-                        const response = await fetch(
-                            `https://api.allorigins.win/raw?url=${enc}`,
-                        );
-                        if (!response.ok) {
-                            throw new Error(
-                                `allorigins /raw fetch failed with status ${response.status}`,
-                            );
-                        }
-                        const text = await response.text();
-                        if (text && (text.includes("<entry") || text.includes("<feed"))) {
-                            xmlText = text;
-                        } else {
-                            throw new Error(
-                                "allorigins /raw response did not look like RSS XML",
-                            );
-                        }
-                    } catch (error) {
-                        lastError = error;
-                    }
-                }
-
-                if (!xmlText) {
-                    const detail =
-                        lastError && lastError.message ? lastError.message : lastError;
-                    // Note: corsproxy.io intentionally omitted — it now
-                    // requires an API key (?key=) and returns 401 without one.
-                    throw new Error(
-                        `Failed to load Reddit RSS (proxies: cors.lol, allorigins /get, /raw). Last error: ${detail}. ` +
-                            `If Reddit returned 403/429 it is rate-limiting proxy traffic — retry later or another subreddit.`,
-                    );
-                }
-
-                const parser = new DOMParser();
-                const doc = parser.parseFromString(xmlText, "text/xml");
-                const entries = Array.from(doc.querySelectorAll("entry"));
-                const seen = new Set();
-
-                videos = entries
-                    .map((entry) => {
-                        const titleEl = entry.querySelector("title");
-                        const title = titleEl
-                            ? titleEl.textContent.trim()
-                            : "Untitled";
-                        const linkEl = entry.querySelector("link");
-                        const redditUrl = linkEl
-                            ? linkEl.getAttribute("href")
-                            : "";
-                        const thumbs = entry.getElementsByTagNameNS(
-                            "http://search.yahoo.com/mrss/",
-                            "thumbnail",
-                        );
-                        const thumbnail =
-                            thumbs.length > 0 && thumbs[0].getAttribute("url")
-                                ? thumbs[0].getAttribute("url")
-                                : "https://via.placeholder.com/200x112/333/666?text=No+Thumbnail";
-                        const contentEl = entry.querySelector("content");
-                        const contentHtml = contentEl
-                            ? contentEl.textContent
-                            : "";
-                        const ytMatch = contentHtml.match(
-                            /href="(https:\/\/(?:www\.)?(?:youtube\.com\/(?:watch\?[^"]*?v=|shorts\/|embed\/)|youtu\.be\/)[^"]+)"/,
-                        );
-                        if (!ytMatch) return null;
-                        const youtubeUrl = ytMatch[1].replace(/&amp;/g, "&");
-                        const youtubeID = getYouTubeID(youtubeUrl);
-                        if (!youtubeID) return null;
-                        return {
-                            title,
-                            url: youtubeUrl,
-                            thumbnail,
-                            isRedditVideo: false,
-                            redditVideo: null,
-                            redditUrl,
-                            _youtubeID: youtubeID,
-                        };
-                    })
-                    .filter((video) => {
-                        if (!video) return false;
-                        if (seen.has(video._youtubeID)) return false;
-                        seen.add(video._youtubeID);
-                        delete video._youtubeID;
-                        return true;
-                    });
-
-                return videos;
+            function mapBackendVideo(v) {
+                return {
+                    title: v.title || "Untitled",
+                    url: v.youtubeUrl,
+                    thumbnail: v.thumbnail,
+                    isRedditVideo: false,
+                    redditVideo: null,
+                    redditUrl: v.redditUrl,
+                };
             }
 
             async function fetchSubreddit(subreddit) {
+                currentSub = subreddit;
+                afterCursor = null;
+                hasMore = false;
+                videos = [];
+                currentIndex = 0;
+                playlist.innerHTML =
+                    '<div class="loading">Loading videos...</div>';
                 try {
-                    await fetchSubredditRSS(subreddit);
-
+                    const data = await fetchVideosPage(subreddit, null);
+                    videos = (data.videos || []).map(mapBackendVideo);
+                    afterCursor = data.after || null;
+                    hasMore = !!data.hasMore;
                     renderPlaylist();
+                    observeSentinel();
                     if (videos.length > 0) {
                         playVideo(0);
                     }
@@ -477,6 +360,49 @@
                 }
             }
 
+            async function loadMore() {
+                if (loading || !hasMore) return;
+                loading = true;
+                try {
+                    const data = await fetchVideosPage(currentSub, afterCursor);
+                    const more = (data.videos || []).map(mapBackendVideo);
+                    videos = videos.concat(more);
+                    afterCursor = data.after || null;
+                    hasMore = !!data.hasMore;
+                    renderPlaylist();
+                    observeSentinel();
+                } catch (error) {
+                    console.error("Error loading more videos:", error);
+                } finally {
+                    loading = false;
+                }
+            }
+
+            function observeSentinel() {
+                const sentinel = document.getElementById("playlistSentinel");
+                if (!sentinel) return;
+                if (playlistObserver) playlistObserver.disconnect();
+                playlistObserver = new IntersectionObserver(
+                    (entries) => {
+                        for (const entry of entries) {
+                            if (entry.isIntersecting) loadMore();
+                        }
+                    },
+                    { root: playlist, rootMargin: "300px", threshold: 0 },
+                );
+                playlistObserver.observe(sentinel);
+            }
+
+            playlist.addEventListener("scroll", () => {
+                if (!hasMore || loading) return;
+                if (
+                    playlist.scrollLeft + playlist.clientWidth >
+                    playlist.scrollWidth - 400
+                ) {
+                    loadMore();
+                }
+            });
+
             function renderPlaylist() {
                 if (videos.length === 0) {
                     playlist.innerHTML =
@@ -484,16 +410,18 @@
                     return;
                 }
 
-                playlist.innerHTML = videos
-                    .map(
-                        (video, index) => `
+                playlist.innerHTML =
+                    videos
+                        .map(
+                            (video, index) => `
                 <div class="playlist-item ${index === currentIndex ? "active" : ""}" onclick="playVideo(${index})">
                     <img src="${video.thumbnail}" alt="${video.title}">
                     <div class="playlist-item-title">${video.title}</div>
                 </div>
             `,
-                    )
-                    .join("");
+                        )
+                        .join("") +
+                    `<div id="playlistSentinel" style="display:inline-block;min-width:60px;padding:20px 8px;color:#888;font-size:12px;vertical-align:top;">${hasMore ? "Loading more&hellip;" : "End"}</div>`;
             }
 
             function playVideo(index) {
@@ -577,6 +505,11 @@
                         inline: "center",
                     });
                 }
+
+                // Endless: prefetch next page when nearing the end
+                if (index >= videos.length - 3) {
+                    loadMore();
+                }
             }
 
             function onPlayerStateChange(event) {
@@ -586,9 +519,14 @@
                 }
             }
 
-            function nextVideo() {
+            async function nextVideo() {
                 if (currentIndex < videos.length - 1) {
                     playVideo(currentIndex + 1);
+                } else if (hasMore) {
+                    await loadMore();
+                    if (currentIndex < videos.length - 1) {
+                        playVideo(currentIndex + 1);
+                    }
                 }
             }
 
