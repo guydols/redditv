@@ -48,6 +48,9 @@ const TTL_MS: i64 = 3_600_000;
 const MAX_POSTS: usize = 500;
 /// Minimum gap between two browser navigations (+ jitter 0-15s).
 const MIN_NAV_GAP: Duration = Duration::from_secs(45);
+/// Priority lane for never-fetched subs: only this short gap applies so a
+/// sub switch fetches then and there instead of showing a countdown.
+const PRIORITY_NAV_GAP: Duration = Duration::from_secs(6);
 /// Fast-path caps so a sub switch never blocks on the browser: first paint
 /// uses short navigation/selector timeouts and a ~2s dwell. Longer dwells
 /// are reserved for background pagination jobs.
@@ -1198,6 +1201,37 @@ fn nav_gate_peek(gate: &mut NavGate) -> Result<(), u64> {
     Ok(())
 }
 
+/// Priority lane for never-fetched subs: bypass the 45s MIN_NAV_GAP +
+/// hourly sliding-window count; only enforce a short in-progress guard
+/// (~6s since the last nav start) to avoid overlapping navigations.
+/// Records the slot like the normal gate so accounting stays accurate.
+fn nav_gate_reserve_priority(gate: &mut NavGate) -> Result<(), u64> {
+    let now = Instant::now();
+    if let Some(last) = gate.last_nav {
+        let elapsed = now.duration_since(last);
+        if elapsed < PRIORITY_NAV_GAP {
+            let wait = (PRIORITY_NAV_GAP - elapsed).as_millis() as u64;
+            return Err(wait);
+        }
+    }
+    gate.last_nav = Some(now);
+    gate.nav_times.push_back(now);
+    Ok(())
+}
+
+/// Peek for the priority lane without recording.
+fn nav_gate_peek_priority(gate: &mut NavGate) -> Result<(), u64> {
+    let now = Instant::now();
+    if let Some(last) = gate.last_nav {
+        let elapsed = now.duration_since(last);
+        if elapsed < PRIORITY_NAV_GAP {
+            let wait = (PRIORITY_NAV_GAP - elapsed).as_millis() as u64;
+            return Err(wait);
+        }
+    }
+    Ok(())
+}
+
 // ---------- timeline helpers ----------
 
 fn timeline_arc(state: &AppState, sub: &str) -> Arc<RwLock<SubTimeline>> {
@@ -1234,11 +1268,14 @@ fn slice_body(
     let videos = &tl.posts[start..end];
     // Endless feed: more may exist on reddit even when the in-memory slice
     // is exhausted (reddit_after cursor) or a background job is running.
+    // The tail cursor is echoed (even for an empty timeline) while more is
+    // pending so the client can retry the same position instead of seeing
+    // after=null as terminal and stalling the endless feed.
     let has_more =
         end < tl.posts.len() || tl.reddit_after.is_some() || tl.loading;
     let next_after = if end < tl.posts.len() {
         Some(end.to_string())
-    } else if has_more && !tl.posts.is_empty() {
+    } else if has_more {
         // Tail slice but more may arrive (reddit_after cursor or background
         // job pending): echo the tail index so the client can retry the same
         // cursor instead of losing its position with after=null.
@@ -1367,7 +1404,14 @@ async fn background_head_refresh(state: AppState, sub: String) {
     if !chrome_disabled() {
         let gate_ok = {
             let mut gate = state.nav_gate.lock().await;
-            nav_gate_reserve(&mut gate).is_ok()
+            // Priority lane: a never-fetched sub bypasses the 45s+jitter +
+            // hourly cap and only respects the short overlap guard so the
+            // first paint fetches then and there.
+            if first_paint {
+                nav_gate_reserve_priority(&mut gate).is_ok()
+            } else {
+                nav_gate_reserve(&mut gate).is_ok()
+            }
         };
         if gate_ok {
             match scrape_sub_via_browser(&sub, true).await {
@@ -1542,6 +1586,11 @@ async fn videos_handler(
         )
     };
     let near_tail = end.saturating_add(PREFETCH_TAIL_THRESHOLD) >= len;
+    // Priority lane: a never-fetched sub (empty timeline) bypasses the
+    // sliding-window count — it fetches then and there. Only a nav
+    // literally in flight (already_loading via the per-sub single-flight
+    // lock) may surface loading; never a 429/countdown with empty videos.
+    let never_fetched = len == 0;
 
     // Fast switch: never block on the browser. Serve the current slice now;
     // prefetch older pages when within 5 items of the tail, otherwise queue
@@ -1562,9 +1611,10 @@ async fn videos_handler(
         Job::None
     };
     let retry_hint = match job {
-        Job::Paginate | Job::Head => gate_retry_hint(&state).await,
+        Job::Paginate | Job::Head if !never_fetched => gate_retry_hint(&state).await,
+        Job::Paginate | Job::Head => None,
         Job::None => {
-            if already_loading {
+            if already_loading && !never_fetched {
                 gate_retry_hint(&state).await
             } else {
                 None
@@ -1618,6 +1668,10 @@ async fn refresh_handler(
         );
     }
     let tl = timeline_arc(&state, &sub);
+    // Priority lane: a never-fetched sub bypasses the global nav-gate peek.
+    // Only a nav literally in flight (per-sub single-flight try_lock) may
+    // return 429; otherwise queue an immediate nav and report loading.
+    let never_fetched = tl.read().await.posts.is_empty();
     // Rate limiter intact: per-sub single-flight + global nav-gate peek.
     {
         let lock = inflight_lock(&state, &sub);
@@ -1629,14 +1683,22 @@ async fn refresh_handler(
                 Some(10_000),
             );
         }
-        let mut gate = state.nav_gate.lock().await;
-        if let Err(retry_ms) = nav_gate_peek(&mut gate) {
-            return error_json(
-                StatusCode::TOO_MANY_REQUESTS,
-                "RATE_LIMITED",
-                "browser navigation budget exhausted; retry later".to_string(),
-                Some(retry_ms),
-            );
+        if !never_fetched {
+            let mut gate = state.nav_gate.lock().await;
+            if let Err(retry_ms) = nav_gate_peek(&mut gate) {
+                return error_json(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "RATE_LIMITED",
+                    "browser navigation budget exhausted; retry later".to_string(),
+                    Some(retry_ms),
+                );
+            }
+        } else {
+            // Priority peek: only the short overlap guard applies. When hot,
+            // still queue (the background job will fall through to HTTP) —
+            // never 429 an empty timeline on the gate.
+            let mut gate = state.nav_gate.lock().await;
+            let _ = nav_gate_peek_priority(&mut gate);
         }
     }
     // Non-blocking: serve the snapshot now, refresh in the background so a
@@ -1845,5 +1907,42 @@ mod unit_tests {
         let body = slice_body("videos", &tl, 0, 5, true, None);
         assert_eq!(body["after"].as_str(), Some("5"));
         assert_eq!(body["videos"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn slice_body_empty_loading_echoes_zero_cursor() {
+        // Never-fetched first paint: empty + loading must echo "0" (not
+        // null) so the client retries the same tail position instead of
+        // treating it as terminal.
+        let tl = tl_with(0, true, None);
+        let body = slice_body("videos", &tl, 0, 25, true, None);
+        assert_eq!(body["after"].as_str(), Some("0"));
+        assert_eq!(body["hasMore"].as_bool(), Some(true));
+        assert_eq!(body["loading"].as_bool(), Some(true));
+        assert!(body.get("retryAfterMs").is_none());
+    }
+
+    #[test]
+    fn priority_gate_bypasses_hourly_cap() {
+        // Fill the sliding window: normal reserve must fail (hourly cap)
+        // while the priority lane still succeeds (only the short guard).
+        let mut gate = NavGate::default();
+        let now = Instant::now();
+        gate.last_nav = Some(now - Duration::from_secs(10));
+        for _ in 0..MAX_NAVS_PER_HOUR {
+            gate.nav_times.push_back(now);
+        }
+        assert!(nav_gate_reserve(&mut gate).is_err());
+        let mut gate2 = NavGate::default();
+        gate2.last_nav = Some(now - Duration::from_secs(10));
+        for _ in 0..MAX_NAVS_PER_HOUR {
+            gate2.nav_times.push_back(now);
+        }
+        assert!(nav_gate_reserve_priority(&mut gate2).is_ok());
+        // Short overlap guard still applies: nav 1s ago is rejected.
+        let mut gate3 = NavGate::default();
+        gate3.last_nav = Some(Instant::now() - Duration::from_secs(1));
+        assert!(nav_gate_reserve_priority(&mut gate3).is_err());
+        assert!(nav_gate_peek_priority(&mut gate3).is_err());
     }
 }

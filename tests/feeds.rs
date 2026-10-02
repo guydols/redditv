@@ -532,6 +532,79 @@ fn videos_polling_keeps_shape_across_requests() {
     }
 }
 
+/// Priority-lane contract: a never-fetched sub fetches then and there.
+/// The first GET (and an immediate second GET inside the 45s nav window)
+/// must be instant 200s with loading:true — never 429 — and must carry no
+/// retryAfterMs countdown while videos are empty.
+#[test]
+fn never_fetched_first_request_is_instant_loading_without_429() {
+    let srv = TestServer::spawn();
+    // Fresh server => r/videosneverfresh is guaranteed never-fetched.
+    let url = format!("{}/api/videos?sub=videosneverfresh&limit=5", srv.base);
+    let get = |url: &str| -> (u16, serde_json::Value, Duration) {
+        let started = std::time::Instant::now();
+        let r = client().get(url).send().unwrap();
+        let elapsed = started.elapsed();
+        let status = r.status().as_u16();
+        let body: serde_json::Value = r.json().unwrap();
+        (status, body, elapsed)
+    };
+    let (s1, b1, e1) = get(&url);
+    assert_eq!(s1, 200, "never-fetched first paint must not be 429, got {s1}: {b1}");
+    assert!(e1 < Duration::from_secs(20), "first paint blocked {e1:?}: {b1}");
+    assert_eq!(b1.get("loading").and_then(|l| l.as_bool()), Some(true), "first paint must report loading:true, got {b1}");
+    let empty1 = b1.get("videos").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false);
+    if empty1 {
+        assert!(b1.get("retryAfterMs").is_none() || b1.get("retryAfterMs").unwrap().is_null(),
+            "empty first paint must not carry a countdown, got {b1}");
+    }
+    // Immediate second switch inside the 45s MIN_NAV_GAP: still priority.
+    let (s2, b2, e2) = get(&url);
+    assert_eq!(s2, 200, "priority lane must survive the nav gap, got {s2}: {b2}");
+    assert!(e2 < Duration::from_secs(20), "second paint blocked {e2:?}: {b2}");
+    assert!(b2.get("loading").and_then(|l| l.as_bool()).is_some(), "loading must be bool, got {b2}");
+    let empty2 = b2.get("videos").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false);
+    if empty2 {
+        assert!(b2.get("retryAfterMs").is_none() || b2.get("retryAfterMs").unwrap().is_null(),
+            "empty second paint must not carry a countdown, got {b2}");
+    }
+}
+
+/// Tail-pagination contract: GET with after==len echoes the tail index
+/// (never null) while a fill is pending, so the client can poll the same
+/// cursor until new rows arrive and the cursor advances.
+#[test]
+fn tail_pagination_cursor_advances() {
+    let srv = TestServer::spawn();
+    let head: serde_json::Value = client()
+        .get(format!("{}/api/videos?sub=videos&limit=5", srv.base))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let len = head.get("videos").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let loading = head.get("loading").and_then(|l| l.as_bool()).unwrap_or(false);
+    // Tail request at after==len.
+    let r = client()
+        .get(format!("{}/api/videos?sub=videos&limit=5&after={len}", srv.base))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let tail: serde_json::Value = r.json().unwrap();
+    assert!(tail.get("videos").and_then(|v| v.as_array()).is_some(), "videos[] required, got {tail}");
+    assert!(tail.get("hasMore").and_then(|h| h.as_bool()).is_some(), "hasMore required, got {tail}");
+    assert!(tail.get("loading").and_then(|l| l.as_bool()).is_some(), "loading required, got {tail}");
+    if len == 0 && loading {
+        // Empty + fill pending: cursor must echo "0", not null, so the
+        // frontend retries the same tail position instead of stalling.
+        assert_eq!(tail.get("after").and_then(|a| a.as_str()), Some("0"), "tail cursor must echo 0 while filling, got {tail}");
+        assert_eq!(tail.get("hasMore").and_then(|h| h.as_bool()), Some(true), "hasMore must hold while filling, got {tail}");
+    }
+    if let Some(a) = tail.get("after") {
+        assert!(a.is_null() || a.is_string(), "after must be string|null, got {tail}");
+    }
+}
+
 /// Live check: hits real Reddit through the local server. Requires network.
 /// Non-blocking API: the first GET queues a background fetch and returns
 /// loading:true, so this polls until videos arrive (up to ~90s).

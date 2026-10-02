@@ -385,7 +385,7 @@
                     ? new Date(data.fetchedAt).toLocaleTimeString()
                     : "never";
                 if (isLoading && rows === 0) {
-                    badge.textContent = `Loading… (fetched ${when})`;
+                    badge.textContent = `Fetching… (fetched ${when})`;
                     badge.dataset.state = "loading";
                     badge.title = "Background fetch running — polling…";
                 } else if (isLoading) {
@@ -401,7 +401,10 @@
                         ? "Served from the 1h server cache"
                         : "Fresh fetch";
                 }
-                if (data.retryAfterMs != null && Number(data.retryAfterMs) > 0) {
+                // Countdown only when stale+rate-limited (rows present). An
+                // empty+loading first paint is a priority fetch, never a
+                // countdown.
+                if (data.retryAfterMs != null && Number(data.retryAfterMs) > 0 && rows > 0) {
                     showRetryCountdown(Number(data.retryAfterMs));
                 }
             }
@@ -539,9 +542,8 @@
                     try {
                         data = await fetchVideosPage(subreddit, null, false);
                     } catch (error) {
-                        if (error && error.status === 429 && error.retryAfterMs) {
-                            showRetryCountdown(error.retryAfterMs);
-                        }
+                        // Empty first paint never counts down: keep the
+                        // Fetching indicator alive and retry.
                         continue;
                     }
                     if (mySeq !== switchSeq) return;
@@ -636,6 +638,10 @@
             }
 
             async function loadMore() {
+                // Client-side overlap guard only: server loading:true must NOT
+                // block — an empty tail slice with loading:true means the
+                // background paginate job hasn't filled yet, so keep the old
+                // cursor and poll until new rows arrive.
                 if (loading || !hasMore) return;
                 // Avoid overlapping tail-fill retries racing the sentinel.
                 loading = true;
@@ -645,6 +651,8 @@
                     const data = await fetchVideosPage(currentSub, afterCursor, false);
                     const more = (data.videos || []).map(mapBackendVideo);
                     const before = videos.length;
+                    // Client-side youtubeId dedupe, but never drop server-new
+                    // rows: every unseen id is appended in server order.
                     const added = appendUnique(more);
                     if (more.length > 0) {
                         // Advance the cursor only when the server actually
@@ -652,6 +660,9 @@
                         // the background paginate job hasn't filled the tail
                         // yet — keep the old cursor so the retry re-asks the
                         // same tail position.
+                        // Server echoes the tail index (after==len) while a
+                        // fill is pending; adopt it so the cursor advances
+                        // once the tail grows.
                         afterCursor = data.after || null;
                     } else if (data.after) {
                         afterCursor = data.after;
