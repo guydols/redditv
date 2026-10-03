@@ -517,7 +517,9 @@
                         playlist.innerHTML =
                             '<div class="loading">Rate limited. Retrying…</div>';
                         showRetryCountdown(error.retryAfterMs);
-                        await sleep(Math.min(error.retryAfterMs, 15000));
+                        // Back off to the server hint (cap 60s + jitter),
+                        // single timer instead of tight loop.
+                        await sleep(cooldownDelayMs(error.retryAfterMs));
                         if (mySeq !== switchSeq) return;
                         // Re-enter the switch flow (bumps seq again is wrong,
                         // so recurse via a fresh poll attempt).
@@ -621,6 +623,12 @@
                         renderPlaylist();
                         observeSentinel();
                         return;
+                    }
+                    // Still loading+empty: honor a 429 cooldown when present
+                    // (single backoff timer, countdown badge already ticking
+                    // via updateFreshBadge); otherwise keep the fast poll.
+                    if (data.retryAfterMs != null && Number(data.retryAfterMs) > 0) {
+                        cooldownWaitMs = cooldownDelayMs(Number(data.retryAfterMs));
                     }
                     // Still loading+empty: keep the Loading indicator alive.
                     playlist.innerHTML =
@@ -759,11 +767,15 @@
                     if (error && error.status === 429 && error.retryAfterMs) {
                         showRetryCountdown(error.retryAfterMs);
                         const sub = currentSub;
+                        const waitMs =
+                            typeof cooldownDelayMs === "function"
+                                ? cooldownDelayMs(error.retryAfterMs)
+                                : Math.min(error.retryAfterMs, 60000);
                         setTimeout(() => {
                             if (sub !== currentSub) return;
                             loading = false;
                             if (hasMore) loadMore();
-                        }, Math.min(error.retryAfterMs, 15000));
+                        }, waitMs);
                         return;
                     }
                 } finally {

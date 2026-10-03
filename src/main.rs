@@ -87,6 +87,38 @@ const UPSTREAM_429_COOLDOWN_MS: i64 = 5 * 60_000;
 /// Clamp for a Retry-After-derived 429 cooldown (5s..30min).
 const MIN_429_COOLDOWN_MS: i64 = 5_000;
 const MAX_429_COOLDOWN_MS: i64 = 30 * 60_000;
+/// OAuth politeness: average 1 req/s on oauth.reddit.com (60/min honest use;
+/// X-Ratelimit-Remaining/Reset headers are honored when present).
+const OAUTH_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Token expiry skew: treat the bearer token as expired 60s before `expires_in`.
+const OAUTH_EXPIRY_SKEW_SECS: u64 = 60;
+/// Minimum cached TTL floor so a tiny `expires_in` never hot-loops token POSTs.
+const OAUTH_MIN_CACHED_TTL_SECS: u64 = 10;
+const OAUTH_TOKEN_URL: &str = "https://www.reddit.com/api/v1/access_token";
+
+/// No-auth mirror chain (default path; no Reddit registration needed).
+/// Order: ArcticShift (primary) -> PullPush (secondary) -> Redlib
+/// round-robin -> RSS -> stealth-browser old.reddit HTML. Direct
+/// api/www.reddit.com + old.reddit.com `.json` unauth legs are NOT part of
+/// the default path; they only run when REDDIT_AUTH_MODE=script with explicit
+/// script creds (opt-in OAuth).
+const ARCTIC_BASE: &str = "https://arctic-shift.photon-reddit.com";
+/// Couple req/s max on ArcticShift: 500ms global gap + X-RateLimit-Reset.
+const ARCTIC_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const PULLPUSH_BASE: &str = "https://api.pullpush.io";
+/// PullPush soft limit (~15/min): 4s minimum gap, backoff, never sole source.
+const PULLPUSH_MIN_INTERVAL: Duration = Duration::from_secs(4);
+/// Redlib round-robin mirrors (same listing schema as Reddit, with
+/// thumbnail+permalink). Rotated on 429/403; a 429 on one host never blocks
+/// the others (per-host cooldowns).
+const REDLIB_HOSTS: &[&str] = &[
+    "safereddit.com",
+    "redlib.catsarch.com",
+    "redlib.r4fo.com",
+    "redlib.cow.rip",
+];
+/// Global politeness per Redlib host.
+const REDLIB_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 // ---------- state ----------
 
@@ -97,6 +129,8 @@ struct AppState {
     inflight: Arc<DashMap<String, Arc<Mutex<()>>>>,
     paginate_inflight: Arc<DashMap<String, Arc<Mutex<()>>>>,
     nav_gate: Arc<Mutex<NavGate>>,
+    oauth: Arc<OAuthState>,
+    mirrors: Arc<MirrorState>,
 }
 
 #[derive(Default)]
@@ -123,6 +157,70 @@ struct NavGate {
     last_nav: Option<Instant>,
     /// Timestamps of recent navigations (sliding 1h window).
     nav_times: VecDeque<Instant>,
+}
+
+/// Shared OAuth state: cached bearer token (with skew expiry), a
+/// single-flight refresh lock, and a global 1 req/s throttle for the
+/// oauth.reddit.com host (plus X-Ratelimit-Remaining/Reset tracking).
+#[derive(Default)]
+struct OAuthState {
+    cached: Mutex<Option<CachedToken>>,
+    /// Held across the whole token POST so concurrent fetches coalesce
+    /// onto one refresh (single-flight).
+    refresh: Mutex<()>,
+    /// Last oauth.reddit.com request start; enforces OAUTH_MIN_INTERVAL.
+    last_req: Mutex<Option<Instant>>,
+    /// Last seen X-Ratelimit-Remaining / X-Ratelimit-Reset (seconds).
+    ratelimit_remaining: Mutex<Option<f64>>,
+    ratelimit_reset_at: Mutex<Option<Instant>>,
+}
+
+struct CachedToken {
+    token: String,
+    expires_at: Instant,
+}
+
+impl CachedToken {
+    fn valid(&self) -> bool {
+        Instant::now() < self.expires_at
+    }
+}
+
+/// Per-mirror politeness + per-host negative cache for the no-auth chain.
+/// A 429/cooldown on one mirror host never blocks the others: cooldown keys
+/// are per-host (`arctic`, `pullpush`, `redlib:<host>`, `rss`), while the
+/// sub-level `rate_limited_until_ms` negative cache still applies only when
+/// every mirror leg reports 429.
+#[derive(Default)]
+struct MirrorState {
+    arctic_last: Mutex<Option<Instant>>,
+    pullpush_last: Mutex<Option<Instant>>,
+    redlib_last: Mutex<Option<Instant>>,
+    /// Round-robin start index into REDLIB_HOSTS.
+    redlib_idx: Mutex<usize>,
+    /// Per-host cooldown until-epoch-ms (negative cache). Keyed by
+    /// `arctic` / `pullpush` / `redlib:<host>` / `rss`.
+    cooldowns: DashMap<String, i64>,
+}
+
+/// Effective TTL for a token: `expires_in` minus the 60s skew, floored so a
+/// tiny `expires_in` never hot-loops token POSTs. Pure for offline tests.
+fn token_ttl_secs(expires_in: u64) -> u64 {
+    expires_in
+        .saturating_sub(OAUTH_EXPIRY_SKEW_SECS)
+        .max(OAUTH_MIN_CACHED_TTL_SECS)
+}
+
+/// Absolute expiry for a token fetched now. Pure wrapper for tests.
+fn token_expiry_for(expires_in: u64) -> Instant {
+    Instant::now() + Duration::from_secs(token_ttl_secs(expires_in))
+}
+
+/// True when the cached expiry is still in the future (i.e. usable).
+/// Pure helper over epoch millis so unit tests stay offline-safe.
+#[cfg(test)]
+fn token_cache_valid(expires_at_ms: i64, now_ms: i64) -> bool {
+    now_ms < expires_at_ms
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,8 +297,36 @@ fn jitter_15s_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Script-app User-Agent: `<platform>:<appID>:<version> by /u/<username>`.
+/// Prefers REDDIT_USER_AGENT, then the legacy REDDIT_UA, else builds the
+/// default from the configured script username when known.
+fn script_default_ua(username: Option<&str>) -> String {
+    match username {
+        Some(u) if !u.is_empty() => format!("linux:redditv:0.1.0 by /u/{}", u),
+        _ => DEFAULT_UA.to_string(),
+    }
+}
+
+fn script_username() -> Option<String> {
+    std::env::var("REDDIT_USERNAME")
+        .or_else(|_| std::env::var("REDDIT_USER"))
+        .or_else(|_| std::env::var("REDDIT_USERNAME_OVERRIDE"))
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 fn reddit_ua() -> String {
-    std::env::var("REDDIT_UA").unwrap_or_else(|_| DEFAULT_UA.to_string())
+    if let Ok(ua) = std::env::var("REDDIT_USER_AGENT") {
+        if !ua.is_empty() {
+            return ua;
+        }
+    }
+    if let Ok(ua) = std::env::var("REDDIT_UA") {
+        if !ua.is_empty() {
+            return ua;
+        }
+    }
+    script_default_ua(script_username().as_deref())
 }
 
 /// When set (e.g. `CHROME_DISABLED=1` in CI/tests), never launch the browser;
@@ -566,24 +692,18 @@ fn videos_from_listing(listing: &RedditListing) -> (Vec<VideoItem>, Option<Strin
 
 // ---------- fetch paths (reqwest fallback; kept when browser disabled/fails) ----------
 
-async fn fetch_public_json(
+async fn fetch_public_json_with_host(
     client: &reqwest::Client,
     ua: &str,
+    host: &str,
+    leg: &'static str,
     sub: &str,
     limit: u32,
     after: Option<&str>,
 ) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
     let leg_start = Instant::now();
-    debug!(sub = %sub, leg = "public", "http leg start");
-    let mut url = format!(
-        "https://www.reddit.com/r/{}/new.json?limit={}&raw_json=1",
-        sub, limit
-    );
-    if let Some(a) = after {
-        if !a.is_empty() {
-            url.push_str(&format!("&after={}", a));
-        }
-    }
+    debug!(sub = %sub, leg = leg, "http leg start");
+    let url = public_json_url(host, sub, limit, after);
     let resp = client
         .get(&url)
         .header(header::USER_AGENT, ua)
@@ -591,7 +711,7 @@ async fn fetch_public_json(
         .send()
         .await
         .map_err(|e| {
-            debug!(sub = %sub, leg = "public", elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg transport error");
+            debug!(sub = %sub, leg = leg, elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg transport error");
             (
                 StatusCode::BAD_GATEWAY,
                 format!("upstream request failed: {}", e),
@@ -601,7 +721,7 @@ async fn fetch_public_json(
     let status = resp.status();
     if status == StatusCode::TOO_MANY_REQUESTS {
         let ms = retry_after_ms(resp.headers());
-        debug!(sub = %sub, leg = "public", status = 429, elapsed_ms = leg_start.elapsed().as_millis() as u64, retry_after_ms = ?ms, "http leg rate-limited");
+        debug!(sub = %sub, leg = leg, status = 429, elapsed_ms = leg_start.elapsed().as_millis() as u64, retry_after_ms = ?ms, "http leg rate-limited");
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "Reddit rate-limited the request".to_string(),
@@ -609,7 +729,7 @@ async fn fetch_public_json(
         ));
     }
     if status == StatusCode::FORBIDDEN {
-        debug!(sub = %sub, leg = "public", status = 403, elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg forbidden");
+        debug!(sub = %sub, leg = leg, status = 403, elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg forbidden");
         return Err((
             StatusCode::BAD_GATEWAY,
             "Reddit denied the request (403)".to_string(),
@@ -617,7 +737,7 @@ async fn fetch_public_json(
         ));
     }
     if status.is_server_error() || status == StatusCode::UNAUTHORIZED {
-        debug!(sub = %sub, leg = "public", status = status.as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg upstream error");
+        debug!(sub = %sub, leg = leg, status = status.as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg upstream error");
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Reddit upstream returned {}", status.as_u16()),
@@ -625,7 +745,7 @@ async fn fetch_public_json(
         ));
     }
     if !status.is_success() {
-        debug!(sub = %sub, leg = "public", status = status.as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg unexpected status");
+        debug!(sub = %sub, leg = leg, status = status.as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg unexpected status");
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Reddit upstream returned {}", status.as_u16()),
@@ -633,7 +753,7 @@ async fn fetch_public_json(
         ));
     }
     let listing: RedditListing = resp.json().await.map_err(|e| {
-        debug!(sub = %sub, leg = "public", elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg parse error");
+        debug!(sub = %sub, leg = leg, elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg parse error");
         (
             StatusCode::BAD_GATEWAY,
             format!("failed to parse Reddit response: {}", e),
@@ -641,10 +761,34 @@ async fn fetch_public_json(
         )
     })?;
     let (videos, after) = videos_from_listing(&listing);
-    debug!(sub = %sub, leg = "public", status = 200, rows = videos.len(), has_after = after.is_some(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg end");
+    debug!(sub = %sub, leg = leg, status = 200, rows = videos.len(), has_after = after.is_some(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg end");
     Ok((videos, after))
 }
 
+/// Unauth public JSON leg (www host) — the existing unauth path, unchanged.
+async fn fetch_public_json(
+    client: &reqwest::Client,
+    ua: &str,
+    sub: &str,
+    limit: u32,
+    after: Option<&str>,
+) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    fetch_public_json_with_host(client, ua, "www.reddit.com", "public", sub, limit, after).await
+}
+
+/// Old.reddit public JSON leg — middle leg of the authed chain
+/// (oauth -> old.reddit JSON -> RSS), gentler than the www host.
+async fn fetch_old_reddit_json(
+    client: &reqwest::Client,
+    ua: &str,
+    sub: &str,
+    limit: u32,
+    after: Option<&str>,
+) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    fetch_public_json_with_host(client, ua, "old.reddit.com", "old-public", sub, limit, after).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OauthCreds {
     client_id: String,
     secret: String,
@@ -652,17 +796,15 @@ struct OauthCreds {
     password: String,
 }
 
-fn oauth_creds() -> Option<OauthCreds> {
-    let client_id = std::env::var("REDDIT_CLIENT_ID").ok()?;
-    let secret = std::env::var("REDDIT_CLIENT_SECRET")
-        .or_else(|_| std::env::var("REDDIT_SECRET"))
-        .ok()?;
-    let username = std::env::var("REDDIT_USERNAME")
-        .or_else(|_| std::env::var("REDDIT_USER"))
-        .or_else(|_| std::env::var("REDDIT_USERNAME_OVERRIDE"))
-        .ok()?;
-    // NOTE: REDDIT_USER doubles as the script username when REDDIT_USERNAME is unset.
-    let password = std::env::var("REDDIT_PASSWORD").ok()?;
+/// Pure constructor for tests (no env access): None when any field is missing.
+fn oauth_creds_from(
+    client_id: Option<String>,
+    secret: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+) -> Option<OauthCreds> {
+    let (client_id, secret, username, password) =
+        (client_id?, secret?, username?, password?);
     if client_id.is_empty() || secret.is_empty() || username.is_empty() || password.is_empty() {
         return None;
     }
@@ -674,56 +816,836 @@ fn oauth_creds() -> Option<OauthCreds> {
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: Option<String>,
-    token_type: Option<String>,
-    error: Option<String>,
+fn oauth_creds() -> Option<OauthCreds> {
+    oauth_creds_from(
+        std::env::var("REDDIT_CLIENT_ID").ok(),
+        std::env::var("REDDIT_CLIENT_SECRET")
+            .or_else(|_| std::env::var("REDDIT_SECRET"))
+            .ok(),
+        std::env::var("REDDIT_USERNAME")
+            .or_else(|_| std::env::var("REDDIT_USER"))
+            .or_else(|_| std::env::var("REDDIT_USERNAME_OVERRIDE"))
+            .ok(),
+        // NOTE: REDDIT_USER doubles as the script username when REDDIT_USERNAME is unset.
+        std::env::var("REDDIT_PASSWORD").ok(),
+    )
 }
 
-async fn fetch_oauth_json(
-    client: &reqwest::Client,
-    ua: &str,
-    sub: &str,
-    limit: u32,
-    after: Option<&str>,
-) -> Option<Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)>> {
-    let creds = oauth_creds()?;
-    let leg_start = Instant::now();
-    debug!(sub = %sub, leg = "oauth", "http leg start");
-    // password grant
-    let token_resp = client
-        .post("https://www.reddit.com/api/v1/access_token")
-        .header(header::USER_AGENT, ua)
-        .basic_auth(&creds.client_id, Some(&creds.secret))
-        .form(&[
-            ("grant_type", "password"),
-            ("username", creds.username.as_str()),
-            ("password", creds.password.as_str()),
-        ])
-        .send()
-        .await
-        .ok()?;
-    if !token_resp.status().is_success() {
-        debug!(sub = %sub, leg = "oauth", status = token_resp.status().as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth token rejected");
-        return None;
+/// Auth mode: `REDDIT_AUTH_MODE=script` WITH complete script creds opts into
+/// OAuth; every other value (including unset — the default) is no-auth.
+/// No Reddit registration is needed by default: the mirror chain
+/// (ArcticShift -> PullPush -> Redlib -> RSS -> browser) serves feeds
+/// without credentials. Pure helper takes the raw env value + creds presence
+/// so unit tests never touch the process environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    Script,
+    NoAuth,
+}
+
+fn auth_mode_from(raw: Option<&str>, has_creds: bool) -> AuthMode {
+    if matches!(raw, Some(v) if v.eq_ignore_ascii_case("script")) && has_creds {
+        return AuthMode::Script;
     }
-    let token: TokenResponse = token_resp.json().await.ok()?;
-    let access = token.access_token?;
-    let _ = token.token_type;
-    if token.error.is_some() && access.is_empty() {
-        debug!(sub = %sub, leg = "oauth", elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth token error");
-        return None;
+    AuthMode::NoAuth
+}
+
+fn auth_mode() -> AuthMode {
+    let raw = std::env::var("REDDIT_AUTH_MODE").ok();
+    auth_mode_from(raw.as_deref(), oauth_creds().is_some())
+}
+
+fn auth_mode_label(mode: AuthMode) -> &'static str {
+    match mode {
+        AuthMode::Script => "script",
+        AuthMode::NoAuth => "no-auth",
     }
+}
+
+/// OAuth listing URL builder (pure, offline-testable).
+/// `sort` is `new` or `hot`; cursor is the reddit `after` (t3_*) value.
+fn oauth_listings_url(sub: &str, sort: &str, limit: u32, after: Option<&str>) -> String {
     let mut url = format!(
-        "https://oauth.reddit.com/r/{}/new?limit={}&raw_json=1",
-        sub, limit
+        "https://oauth.reddit.com/r/{}/{}.json?raw_json=1&limit={}",
+        sub, sort, limit
     );
     if let Some(a) = after {
         if !a.is_empty() {
             url.push_str(&format!("&after={}", a));
         }
     }
+    url
+}
+
+/// Public (unauth) JSON URL builder for a given host (pure, offline-testable).
+fn public_json_url(host: &str, sub: &str, limit: u32, after: Option<&str>) -> String {
+    let mut url = format!(
+        "https://{}/r/{}/new.json?limit={}&raw_json=1",
+        host, sub, limit
+    );
+    if let Some(a) = after {
+        if !a.is_empty() {
+            url.push_str(&format!("&after={}", a));
+        }
+    }
+    url
+}
+
+/// Script-UA header value check helper: must match
+/// `<platform>:<appID>:<version> by /u/<username>` (contains " by /u/").
+/// Pure for offline tests.
+fn is_script_ua(ua: &str) -> bool {
+    ua.contains(" by /u/") && !ua.contains("(by /u/")
+}
+
+// ---------- no-auth mirrors (ArcticShift / PullPush / Redlib) ----------
+
+/// YouTube thumbnail fallback when a mirror ships no thumbnail.
+fn youtube_thumb(yt_id: &str) -> String {
+    format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", yt_id)
+}
+
+/// ArcticShift search URL builder (pure, offline-testable).
+/// Pagination is epoch-based (`after` = oldest `created_utc` seen); t3
+/// cursors are not understood by ArcticShift and are dropped.
+fn arctic_search_url(sub: &str, limit: u32, after_epoch: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/api/posts/search?subreddit={}&sort=desc&limit={}&fields=title,url,id,subreddit,created_utc,author,score,num_comments",
+        ARCTIC_BASE, sub, limit
+    );
+    if let Some(a) = after_epoch {
+        if !a.is_empty() {
+            url.push_str(&format!("&after={}", a));
+        }
+    }
+    url
+}
+
+/// PullPush search URL builder (pure, offline-testable).
+/// Newest-first by `created_utc`; older pages use `before` (epoch secs).
+fn pullpush_search_url(sub: &str, size: u32, before_epoch: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/reddit/search/submission/?subreddit={}&sort=desc&sort_type=created_utc&size={}",
+        PULLPUSH_BASE, sub, size
+    );
+    if let Some(b) = before_epoch {
+        if !b.is_empty() {
+            url.push_str(&format!("&before={}", b));
+        }
+    }
+    url
+}
+
+/// Redlib listing URL builder for one mirror host (pure, offline-testable).
+/// Same listing schema as Reddit (thumbnail+permalink), t3 cursors apply.
+fn redlib_url(host: &str, sub: &str, limit: u32, after: Option<&str>) -> String {
+    let mut url = format!("https://{}/r/{}/new.json?limit={}&raw_json=1", host, sub, limit);
+    if let Some(a) = after {
+        if !a.is_empty() {
+            url.push_str(&format!("&after={}", a));
+        }
+    }
+    url
+}
+
+/// Redlib hosts in round-robin order starting at `start` (pure).
+fn redlib_order(start: usize) -> Vec<&'static str> {
+    let n = REDLIB_HOSTS.len();
+    (0..n).map(|i| REDLIB_HOSTS[(start + i) % n]).collect()
+}
+
+/// True when `after` looks like epoch seconds (ArcticShift/PullPush cursor).
+fn is_epoch_cursor(s: &str) -> bool {
+    !s.is_empty() && s.len() >= 9 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Split an incoming `after` cursor: epoch cursors go to ArcticShift/PullPush
+/// (`before`/`after` epoch params), t3 cursors go to Redlib/OAuth legs.
+/// Pure helper so pagination mapping stays offline-testable.
+fn split_after_cursor(after: Option<&str>) -> (Option<String>, Option<String>) {
+    match after {
+        Some(a) if !a.is_empty() && is_epoch_cursor(a) => (Some(a.to_string()), None),
+        Some(a) if !a.is_empty() => (None, Some(a.to_string())),
+        _ => (None, None),
+    }
+}
+
+/// Oldest `created_utc` in `posts` as an epoch-seconds cursor for the next
+/// ArcticShift/PullPush page. None when no timestamps are known.
+fn epoch_cursor_from_posts(posts: &[VideoItem]) -> Option<String> {
+    posts.iter().filter_map(|v| v.created_utc).min().map(|m| m.to_string())
+}
+
+/// Best `reddit_after` cursor to store: prefer a t3 cursor when the winning
+/// leg supplied one, else fall back to the epoch of the oldest post seen.
+/// Pure for offline tests.
+fn best_cursor(t3: Option<String>, posts: &[VideoItem]) -> Option<String> {
+    if let Some(c) = t3 {
+        if !c.is_empty() {
+            return Some(c);
+        }
+    }
+    epoch_cursor_from_posts(posts)
+}
+
+/// Newest-first ordering by `created_utc` (unknown timestamps sink last).
+fn sort_newest_first(items: &mut Vec<VideoItem>) {
+    items.sort_by(|a, b| match (b.created_utc, a.created_utc) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+}
+
+/// Merge several mirror pages: concat, newest-first, dedupe+cap.
+fn merge_mirror_pages(mut pages: Vec<Vec<VideoItem>>) -> Vec<VideoItem> {
+    let mut all: Vec<VideoItem> = pages.drain(..).flatten().collect();
+    sort_newest_first(&mut all);
+    dedupe_cap(all)
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)] // subreddit/author retained for upstream schema compat + debugging.
+struct ArcticPost {
+    id: Option<String>,
+    title: Option<String>,
+    url: Option<String>,
+    subreddit: Option<String>,
+    created_utc: Option<f64>,
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ArcticResponse {
+    #[serde(default)]
+    data: Vec<ArcticPost>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PullPushPost {
+    id: Option<serde_json::Value>,
+    title: Option<String>,
+    url: Option<String>,
+    permalink: Option<String>,
+    thumbnail: Option<String>,
+    created_utc: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PullPushResponse {
+    #[serde(default)]
+    data: Vec<PullPushPost>,
+}
+
+/// Map ArcticShift rows: `title`->title, `url`->url (YouTube only),
+/// `id`->redditId with permalink synthesized as `/r/{sub}/comments/{id}/`.
+/// No thumbnail from ArcticShift: fall back to YouTube hqdefault.
+fn videos_from_arctic(resp: &ArcticResponse, sub: &str) -> (Vec<VideoItem>, Option<String>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<VideoItem> = Vec::new();
+    for post in &resp.data {
+        let url = match post.url.as_deref() {
+            Some(u) if !u.is_empty() => u,
+            _ => continue,
+        };
+        let Some(yt_id) = extract_youtube_id(url) else {
+            continue;
+        };
+        if !seen.insert(yt_id.clone()) {
+            continue;
+        }
+        let raw_id = post.id.as_deref().unwrap_or("").trim().to_string();
+        if raw_id.is_empty() {
+            continue;
+        }
+        let short_id = raw_id.strip_prefix("t3_").unwrap_or(&raw_id).to_string();
+        let permalink = format!("/r/{}/comments/{}/", sub, short_id);
+        out.push(VideoItem {
+            youtube_id: yt_id.clone(),
+            youtube_url: clean_url(url),
+            title: post.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| "Untitled".to_string()),
+            reddit_url: format!("https://www.reddit.com{}", permalink),
+            thumbnail: youtube_thumb(&yt_id),
+            created_utc: post.created_utc.map(|f| f as i64),
+            reddit_id: Some(format!("t3_{}", short_id)),
+        });
+    }
+    sort_newest_first(&mut out);
+    let cursor = epoch_cursor_from_posts(&out);
+    (out, cursor)
+}
+
+fn pullpush_id_string(v: &Option<serde_json::Value>) -> String {
+    match v {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Map PullPush rows: direct `title`/`url`/`permalink`/`thumbnail`/
+/// `created_utc` fields. Missing thumbnails fall back to YouTube hqdefault;
+/// relative permalinks are rooted at www.reddit.com.
+fn videos_from_pullpush(resp: &PullPushResponse) -> (Vec<VideoItem>, Option<String>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<VideoItem> = Vec::new();
+    for post in &resp.data {
+        let url = match post.url.as_deref() {
+            Some(u) if !u.is_empty() => u,
+            _ => continue,
+        };
+        let Some(yt_id) = extract_youtube_id(url) else {
+            continue;
+        };
+        if !seen.insert(yt_id.clone()) {
+            continue;
+        }
+        let reddit_url = match post.permalink.as_deref() {
+            Some(p) if p.starts_with("http") => p.to_string(),
+            Some(p) if !p.is_empty() => format!("https://www.reddit.com{}", if p.starts_with('/') { p.to_string() } else { format!("/{}", p) }),
+            _ => {
+                let raw = pullpush_id_string(&post.id);
+                if raw.is_empty() {
+                    String::new()
+                } else {
+                    format!("https://www.reddit.com/comments/{}/", raw.trim_start_matches("t3_"))
+                }
+            }
+        };
+        let thumbnail = match post.thumbnail.as_deref() {
+            Some(t) if t.starts_with("http") => clean_url(t),
+            _ => youtube_thumb(&yt_id),
+        };
+        let reddit_id = if !reddit_url.is_empty() {
+            reddit_id_from_permalink(&reddit_url).or_else(|| {
+                let raw = pullpush_id_string(&post.id);
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(format!("t3_{}", raw.trim_start_matches("t3_")))
+                }
+            })
+        } else {
+            None
+        };
+        out.push(VideoItem {
+            youtube_id: yt_id.clone(),
+            youtube_url: clean_url(url),
+            title: post.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| "Untitled".to_string()),
+            reddit_url,
+            thumbnail,
+            created_utc: post.created_utc.map(|f| f as i64),
+            reddit_id,
+        });
+    }
+    sort_newest_first(&mut out);
+    let cursor = epoch_cursor_from_posts(&out);
+    (out, cursor)
+}
+
+/// Per-host cooldown key helpers (pure).
+fn redlib_cooldown_key(host: &str) -> String {
+    format!("redlib:{}", host)
+}
+
+/// Remaining per-host cooldown, if active.
+fn mirror_cooldown_remaining(mirrors: &MirrorState, key: &str, now: i64) -> Option<u64> {
+    mirrors.cooldowns.get(key).and_then(|until| {
+        let until = *until;
+        if now < until {
+            Some((until - now).max(0) as u64)
+        } else {
+            None
+        }
+    })
+}
+
+fn mirror_set_cooldown(mirrors: &MirrorState, key: &str, retry_after: Option<u64>) {
+    let backoff = upstream_429_cooldown_ms(retry_after);
+    mirrors.cooldowns.insert(key.to_string(), now_ms() + backoff);
+}
+
+/// Parse `X-RateLimit-Reset` (seconds, possibly fractional) into ms.
+/// Pure helper; Retry-After is handled separately by `retry_after_ms`.
+fn ratelimit_reset_ms(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|secs| (secs.max(0.0) * 1000.0) as u64)
+        .filter(|ms| *ms > 0)
+}
+
+/// Global per-mirror politeness throttle.
+async fn throttle_last(last: &Mutex<Option<Instant>>, min: Duration) {
+    let wait: Option<Duration> = {
+        let guard = last.lock().await;
+        match *guard {
+            Some(t) => {
+                let elapsed = t.elapsed();
+                if elapsed < min {
+                    Some(min - elapsed)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(d) = wait {
+        tokio::time::sleep(d).await;
+    }
+    *last.lock().await = Some(Instant::now());
+}
+
+async fn fetch_arctic(
+    state: &AppState,
+    sub: &str,
+    limit: u32,
+    after_epoch: Option<&str>,
+) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    if let Some(remain) = mirror_cooldown_remaining(&state.mirrors, "arctic", now_ms()) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "ArcticShift mirror cooling down".to_string(),
+            Some(remain),
+        ));
+    }
+    throttle_last(&state.mirrors.arctic_last, ARCTIC_MIN_INTERVAL).await;
+    let leg_start = Instant::now();
+    debug!(sub = %sub, leg = "arctic", "http leg start");
+    let url = arctic_search_url(sub, limit, after_epoch);
+    let resp = state
+        .client
+        .get(&url)
+        .header(header::USER_AGENT, reddit_ua())
+        .header(header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| {
+            debug!(sub = %sub, leg = "arctic", elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg transport error");
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("ArcticShift request failed: {}", e),
+                None,
+            )
+        })?;
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let ms = retry_after_ms(&headers).or_else(|| ratelimit_reset_ms(&headers));
+        mirror_set_cooldown(&state.mirrors, "arctic", ms);
+        debug!(sub = %sub, leg = "arctic", status = 429, retry_after_ms = ?ms, "http leg rate-limited (per-host cooldown, others unaffected)");
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "ArcticShift rate-limited the request".to_string(),
+            ms,
+        ));
+    }
+    if status == StatusCode::FORBIDDEN {
+        debug!(sub = %sub, leg = "arctic", status = 403, "http leg forbidden");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "ArcticShift denied the request (403)".to_string(),
+            None,
+        ));
+    }
+    if !status.is_success() {
+        debug!(sub = %sub, leg = "arctic", status = status.as_u16(), "http leg unexpected status");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ArcticShift upstream returned {}", status.as_u16()),
+            None,
+        ));
+    }
+    let parsed: ArcticResponse = resp.json().await.map_err(|e| {
+        debug!(sub = %sub, leg = "arctic", error = %e, "http leg parse error");
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to parse ArcticShift response: {}", e),
+            None,
+        )
+    })?;
+    let (videos, cursor) = videos_from_arctic(&parsed, sub);
+    debug!(sub = %sub, leg = "arctic", rows = videos.len(), has_after = cursor.is_some(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg end");
+    Ok((videos, cursor))
+}
+
+async fn fetch_pullpush(
+    state: &AppState,
+    sub: &str,
+    size: u32,
+    before_epoch: Option<&str>,
+) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    if let Some(remain) = mirror_cooldown_remaining(&state.mirrors, "pullpush", now_ms()) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "PullPush mirror cooling down".to_string(),
+            Some(remain),
+        ));
+    }
+    throttle_last(&state.mirrors.pullpush_last, PULLPUSH_MIN_INTERVAL).await;
+    let leg_start = Instant::now();
+    debug!(sub = %sub, leg = "pullpush", "http leg start");
+    let url = pullpush_search_url(sub, size, before_epoch);
+    let resp = state
+        .client
+        .get(&url)
+        .header(header::USER_AGENT, reddit_ua())
+        .header(header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| {
+            debug!(sub = %sub, leg = "pullpush", elapsed_ms = leg_start.elapsed().as_millis() as u64, error = %e, "http leg transport error");
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("PullPush request failed: {}", e),
+                None,
+            )
+        })?;
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let ms = retry_after_ms(&headers).or_else(|| ratelimit_reset_ms(&headers));
+        // Exponential backoff flavor: per-host negative cache (never sole
+        // source, so the chain continues to Redlib/RSS regardless).
+        mirror_set_cooldown(&state.mirrors, "pullpush", ms);
+        debug!(sub = %sub, leg = "pullpush", status = 429, retry_after_ms = ?ms, "http leg rate-limited (per-host cooldown, others unaffected)");
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "PullPush rate-limited the request".to_string(),
+            ms,
+        ));
+    }
+    if status == StatusCode::FORBIDDEN {
+        debug!(sub = %sub, leg = "pullpush", status = 403, "http leg forbidden");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "PullPush denied the request (403)".to_string(),
+            None,
+        ));
+    }
+    if !status.is_success() {
+        debug!(sub = %sub, leg = "pullpush", status = status.as_u16(), "http leg unexpected status");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("PullPush upstream returned {}", status.as_u16()),
+            None,
+        ));
+    }
+    let parsed: PullPushResponse = resp.json().await.map_err(|e| {
+        debug!(sub = %sub, leg = "pullpush", error = %e, "http leg parse error");
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to parse PullPush response: {}", e),
+            None,
+        )
+    })?;
+    let (videos, cursor) = videos_from_pullpush(&parsed);
+    debug!(sub = %sub, leg = "pullpush", rows = videos.len(), has_after = cursor.is_some(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg end");
+    Ok((videos, cursor))
+}
+
+/// Redlib fetch across the round-robin hosts. Tries each host in rotation
+/// order; 429/403 on one host sets a per-host cooldown and rotates to the
+/// next host instead of failing the chain. Returns the first success, or a
+/// 429 only when every tried host was rate-limited.
+async fn fetch_redlib(
+    state: &AppState,
+    sub: &str,
+    limit: u32,
+    after_t3: Option<&str>,
+) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    let start = *state.mirrors.redlib_idx.lock().await;
+    let order = redlib_order(start);
+    let mut saw_429: Option<u64> = None;
+    let mut last_err: Option<(StatusCode, String, Option<u64>)> = None;
+    let mut attempted = 0usize;
+    for host in order {
+        let key = redlib_cooldown_key(host);
+        if let Some(remain) = mirror_cooldown_remaining(&state.mirrors, &key, now_ms()) {
+            saw_429 = Some(saw_429.map(|m: u64| m.min(remain)).unwrap_or(remain));
+            continue;
+        }
+        throttle_last(&state.mirrors.redlib_last, REDLIB_MIN_INTERVAL).await;
+        let leg_start = Instant::now();
+        let url = redlib_url(host, sub, limit, after_t3);
+        debug!(sub = %sub, leg = "redlib", host = %host, "http leg start");
+        let resp = match state
+            .client
+            .get(&url)
+            .header(header::USER_AGENT, reddit_ua())
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(sub = %sub, leg = "redlib", host = %host, error = %e, "http leg transport error");
+                last_err = Some((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Redlib {} request failed: {}", host, e),
+                    None,
+                ));
+                continue;
+            }
+        };
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let ms = retry_after_ms(&headers).or_else(|| ratelimit_reset_ms(&headers));
+            mirror_set_cooldown(&state.mirrors, &key, ms);
+            saw_429 = Some(saw_429.map(|m: u64| m.min(ms.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))).unwrap_or(ms.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64)));
+            debug!(sub = %sub, leg = "redlib", host = %host, status = 429, retry_after_ms = ?ms, "http leg rate-limited, rotating");
+            // Advance the round-robin start so the next call starts elsewhere.
+            *state.mirrors.redlib_idx.lock().await = (start + attempted + 1) % REDLIB_HOSTS.len();
+            attempted += 1;
+            last_err = Some((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Redlib {} rate-limited the request", host),
+                ms,
+            ));
+            continue;
+        }
+        if status == StatusCode::FORBIDDEN {
+            mirror_set_cooldown(&state.mirrors, &key, None);
+            debug!(sub = %sub, leg = "redlib", host = %host, status = 403, "http leg forbidden, rotating");
+            *state.mirrors.redlib_idx.lock().await = (start + attempted + 1) % REDLIB_HOSTS.len();
+            attempted += 1;
+            last_err = Some((
+                StatusCode::BAD_GATEWAY,
+                format!("Redlib {} denied the request (403)", host),
+                None,
+            ));
+            continue;
+        }
+        if !status.is_success() {
+            debug!(sub = %sub, leg = "redlib", host = %host, status = status.as_u16(), "http leg unexpected status");
+            last_err = Some((
+                StatusCode::BAD_GATEWAY,
+                format!("Redlib {} upstream returned {}", host, status.as_u16()),
+                None,
+            ));
+            continue;
+        }
+        let listing: RedditListing = match resp.json().await {
+            Ok(l) => l,
+            Err(e) => {
+                debug!(sub = %sub, leg = "redlib", host = %host, error = %e, "http leg parse error");
+                last_err = Some((
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to parse Redlib {} response: {}", host, e),
+                    None,
+                ));
+                continue;
+            }
+        };
+        let (mut videos, after) = videos_from_listing(&listing);
+        sort_newest_first(&mut videos);
+        debug!(sub = %sub, leg = "redlib", host = %host, rows = videos.len(), has_after = after.is_some(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "http leg end");
+        return Ok((dedupe_cap(videos), after));
+    }
+    if let Some(err) = last_err {
+        if err.0 == StatusCode::TOO_MANY_REQUESTS || saw_429.is_some() {
+            // Every host cooled down or rate-limited: surface 429 so the
+            // sub-level negative cache still applies.
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "Redlib mirrors rate-limited the request".to_string(),
+                saw_429.or(err.2),
+            ));
+        }
+        return Err(err);
+    }
+    Err((
+        StatusCode::BAD_GATEWAY,
+        "Redlib mirrors unreachable".to_string(),
+        None,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // token_type is required for deserialization compat; only access_token/expires_in are used.
+struct TokenResponse {
+    access_token: Option<String>,
+    token_type: Option<String>,
+    expires_in: Option<u64>,
+    error: Option<serde_json::Value>,
+}
+
+/// Enforce the global ~1 req/s OAuth throttle before hitting
+/// oauth.reddit.com. Also honors a previously observed
+/// X-Ratelimit-Remaining==0 + Reset window by sleeping until reset.
+async fn oauth_throttle(oauth: &OAuthState) {
+    // Honor an exhausted ratelimit window first.
+    let wait_reset: Option<Duration> = {
+        let rem = *oauth.ratelimit_remaining.lock().await;
+        let reset = *oauth.ratelimit_reset_at.lock().await;
+        match (rem, reset) {
+            (Some(r), Some(at)) if r < 1.0 => {
+                let now = Instant::now();
+                if at > now {
+                    Some(at - now)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+    if let Some(d) = wait_reset {
+        debug!(wait_ms = d.as_millis() as u64, "oauth throttle: ratelimit exhausted, waiting for reset window");
+        tokio::time::sleep(d).await;
+    }
+    // Steady-state 1 req/s average.
+    let wait_gap: Option<Duration> = {
+        let last = *oauth.last_req.lock().await;
+        match last {
+            Some(t) => {
+                let elapsed = t.elapsed();
+                if elapsed < OAUTH_MIN_INTERVAL {
+                    Some(OAUTH_MIN_INTERVAL - elapsed)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(d) = wait_gap {
+        tokio::time::sleep(d).await;
+    }
+    *oauth.last_req.lock().await = Some(Instant::now());
+}
+
+/// Record X-Ratelimit-Remaining / X-Ratelimit-Reset from an oauth response
+/// (honest 60/min use). Missing/unparseable headers leave prior state alone.
+async fn oauth_record_ratelimit(oauth: &OAuthState, headers: &HeaderMap) {
+    let remaining: Option<f64> = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok());
+    let reset_secs: Option<f64> = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok());
+    if let Some(r) = remaining {
+        *oauth.ratelimit_remaining.lock().await = Some(r);
+    }
+    if let Some(s) = reset_secs {
+        let reset_at = Instant::now() + Duration::from_secs_f64(s.max(0.0));
+        *oauth.ratelimit_reset_at.lock().await = Some(reset_at);
+    }
+    if remaining.is_some() || reset_secs.is_some() {
+        debug!(remaining = ?remaining, reset_secs = ?reset_secs, "oauth ratelimit headers observed");
+    }
+}
+
+/// Raw script password-grant POST. Returns the bearer token + expires_in.
+/// Never logs secrets; callers log only status codes on failure.
+async fn request_oauth_token(
+    client: &reqwest::Client,
+    ua: &str,
+    creds: &OauthCreds,
+) -> Option<(String, u64)> {
+    let leg_start = Instant::now();
+    let resp = client
+        .post(OAUTH_TOKEN_URL)
+        .header(header::USER_AGENT, ua)
+        .basic_auth(&creds.client_id, Some(&creds.secret))
+        .form(&[
+            ("grant_type", "password"),
+            ("username", creds.username.as_str()),
+            ("password", creds.password.as_str()),
+            ("duration", "permanent"),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        debug!(status = resp.status().as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth token rejected (status)");
+        return None;
+    }
+    let token: TokenResponse = resp.json().await.ok()?;
+    let access = token.access_token.filter(|t| !t.is_empty())?;
+    if token.error.is_some() {
+        debug!(elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth token body carried error field");
+        // Reddit sometimes includes a benign error field alongside a token;
+        // only fail when there is no usable access token (handled above).
+    }
+    let expires_in = token.expires_in.unwrap_or(3600);
+    Some((access, expires_in))
+}
+
+/// Cached bearer token with single-flight refresh. Returns None when creds
+/// are absent/disabled or the token POST fails (caller must fall back to
+/// unauth legs, never fail hard). Logs warn (no secrets) on refresh failure.
+async fn oauth_bearer_token(
+    oauth: &OAuthState,
+    client: &reqwest::Client,
+    ua: &str,
+) -> Option<String> {
+    // Fast path: valid cached token, no lock contention beyond the guard.
+    {
+        let guard = oauth.cached.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            if cached.valid() {
+                return Some(cached.token.clone());
+            }
+        }
+    }
+    // Single-flight: only one task performs the token POST at a time.
+    let _refresh_guard = oauth.refresh.lock().await;
+    // Re-check after acquiring the refresh lock (another task may have filled it).
+    {
+        let guard = oauth.cached.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            if cached.valid() {
+                return Some(cached.token.clone());
+            }
+        }
+    }
+    let creds = oauth_creds()?;
+    if auth_mode() == AuthMode::NoAuth {
+        return None;
+    }
+    match request_oauth_token(client, ua, &creds).await {
+        Some((token, expires_in)) => {
+            let expires_at = token_expiry_for(expires_in);
+            *oauth.cached.lock().await = Some(CachedToken {
+                token: token.clone(),
+                expires_at,
+            });
+            debug!(expires_in = expires_in, ttl_secs = token_ttl_secs(expires_in), "oauth token refreshed (cached)");
+            Some(token)
+        }
+        None => {
+            warn!("oauth token refresh failed; falling back to mirror legs (arctic + pullpush + redlib + RSS)");
+            None
+        }
+    }
+}
+
+async fn fetch_oauth_json(
+    oauth: &OAuthState,
+    client: &reqwest::Client,
+    ua: &str,
+    sub: &str,
+    limit: u32,
+    after: Option<&str>,
+) -> Option<Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)>> {
+    if auth_mode() == AuthMode::NoAuth {
+        return None;
+    }
+    if oauth_creds().is_none() {
+        return None;
+    }
+    let leg_start = Instant::now();
+    debug!(sub = %sub, leg = "oauth", "http leg start");
+    let access = oauth_bearer_token(oauth, client, ua).await?;
+    oauth_throttle(oauth).await;
+    let url = oauth_listings_url(sub, "new", limit, after);
     let resp = client
         .get(&url)
         .header(header::USER_AGENT, ua)
@@ -732,6 +1654,7 @@ async fn fetch_oauth_json(
         .send()
         .await
         .ok()?;
+    oauth_record_ratelimit(oauth, resp.headers()).await;
     if resp.status() == StatusCode::TOO_MANY_REQUESTS {
         let ms = retry_after_ms(resp.headers());
         debug!(sub = %sub, leg = "oauth", status = 429, elapsed_ms = leg_start.elapsed().as_millis() as u64, retry_after_ms = ?ms, "http leg rate-limited");
@@ -741,9 +1664,16 @@ async fn fetch_oauth_json(
             ms,
         )));
     }
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        // Bearer rejected (revoked/expired race): drop the cache so the next
+        // call refreshes, then fall through to unauth legs this round.
+        *oauth.cached.lock().await = None;
+        debug!(sub = %sub, leg = "oauth", status = 401, elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth bearer rejected; cache cleared, falling through to unauth");
+        return None;
+    }
     if !resp.status().is_success() {
-        debug!(sub = %sub, leg = "oauth", status = resp.status().as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth fetch non-success, falling through to RSS");
-        return None; // let caller fall through to RSS
+        debug!(sub = %sub, leg = "oauth", status = resp.status().as_u16(), elapsed_ms = leg_start.elapsed().as_millis() as u64, "oauth fetch non-success, falling through to unauth");
+        return None; // let caller fall through to public JSON / RSS
     }
     let listing: RedditListing = resp.json().await.ok()?;
     let (videos, after) = videos_from_listing(&listing);
@@ -869,103 +1799,319 @@ async fn fetch_rss_fallback(
     Ok(out)
 }
 
-/// Reqwest JSON -> OAuth -> RSS fallback chain. Returns timeline posts
-/// (newest-first) plus the reddit `after` cursor when known.
+/// Reqwest fallback chain. Returns timeline posts (newest-first) plus the
+/// reddit `after` cursor when known.
+///
+/// Default (no-auth, no registration needed) order:
+/// ArcticShift (primary, epoch pagination) -> PullPush (secondary, 4s gap,
+/// never sole source) -> Redlib round-robin (t3 cursors, per-host rotate) ->
+/// RSS (head fill only). A 429 on one mirror sets a per-host cooldown and the
+/// chain continues to the next mirror — it never blocks the others; the
+/// sub-level 429 negative cache applies only when every leg reports 429.
+///
+/// Opt-in OAuth (`REDDIT_AUTH_MODE=script` with complete script creds) tries
+/// `oauth.reddit.com` first, then the same mirror chain, then the legacy
+/// old.reddit/`.json` legs before RSS. Direct `www.reddit.com/.json` unauth
+/// is NOT part of the default path. A failed token fetch never fails hard.
 async fn fetch_http_fallback(
-    client: &reqwest::Client,
+    state: &AppState,
     sub: &str,
     after: Option<&str>,
 ) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    let client = &state.client;
     let ua = reddit_ua();
     // Timeline fill always grabs the newest page; pagination is served
     // from memory via the index cursor.
     const FILL_LIMIT: u32 = 100;
     let chain_start = Instant::now();
-    debug!(sub = %sub, chain = "fallback", has_after = after.is_some(), "http chain start");
-    match fetch_public_json(client, &ua, sub, FILL_LIMIT, after).await {
-        Ok((videos, after)) => {
-            debug!(sub = %sub, chain = "fallback", winner = "public", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
-            return Ok((dedupe_cap(videos), after));
+    let authed = auth_mode() == AuthMode::Script && oauth_creds().is_some();
+    let (epoch_after, t3_after) = split_after_cursor(after);
+    debug!(sub = %sub, chain = "fallback", authed = authed, has_after = after.is_some(), "http chain start");
+    let mut saw_429: Option<u64> = None;
+    let mut last_err: Option<(StatusCode, String, Option<u64>)> = None;
+    let mut empty_ok: Option<(Vec<VideoItem>, Option<String>)> = None;
+    let note_429 = |saw: &mut Option<u64>, r: Option<u64>| {
+        if let Some(ms) = r {
+            *saw = Some(saw.map(|m| m.min(ms)).unwrap_or(ms));
+        } else {
+            *saw = Some(saw.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64));
         }
-        Err((code, msg, retry_ms)) => {
-            if code == StatusCode::TOO_MANY_REQUESTS {
-                return Err((code, msg, retry_ms));
-            }
-            if code != StatusCode::BAD_GATEWAY {
-                return Err((code, msg, retry_ms));
-            }
-            if let Some(oauth_result) =
-                fetch_oauth_json(client, &ua, sub, FILL_LIMIT, after).await
-            {
-                match oauth_result {
-                    Ok((videos, after)) => {
+    };
+    if authed {
+        // OAuth-first (cached token; token failure falls through silently).
+        // A 429 here no longer short-circuits: mirrors still get a chance.
+        if let Some(oauth_result) =
+            fetch_oauth_json(&state.oauth, client, &ua, sub, FILL_LIMIT, t3_after.as_deref().or(after)).await
+        {
+            match oauth_result {
+                Ok((videos, after)) => {
+                    if !videos.is_empty() {
                         debug!(sub = %sub, chain = "fallback", winner = "oauth", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
-                        return Ok((dedupe_cap(videos), after));
+                        let mut v = videos;
+                        sort_newest_first(&mut v);
+                        return Ok((dedupe_cap(v), after));
                     }
-                    Err((c2, m2, r2)) => {
-                        if c2 == StatusCode::TOO_MANY_REQUESTS {
-                            return Err((c2, m2, r2));
-                        }
-                    }
+                    empty_ok = empty_ok.or(Some((videos, after)));
                 }
-            }
-            // RSS has no `after` cursor; only usable for the head fill.
-            if after.is_some() {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    format!("Reddit upstream failed for r/{}: {}", sub, msg),
-                    retry_ms,
-                ));
-            }
-            match fetch_rss_fallback(client, &ua, sub).await {
-                Ok(all) => {
-                    debug!(sub = %sub, chain = "fallback", winner = "rss", rows = all.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
-                    Ok((dedupe_cap(all), None))
-                }
-                Err((c3, m3, r3)) => {
-                    if c3 == StatusCode::TOO_MANY_REQUESTS {
-                        return Err((c3, "Reddit rate-limited the request".to_string(), r3));
+                Err((c2, m2, r2)) => {
+                    if c2 == StatusCode::TOO_MANY_REQUESTS {
+                        note_429(&mut saw_429, r2);
+                        debug!(sub = %sub, chain = "fallback", leg = "oauth", error = %m2, "oauth leg rate-limited, continuing to mirrors");
+                    } else {
+                        debug!(sub = %sub, chain = "fallback", leg = "oauth", error = %m2, "oauth leg missed, trying mirrors");
                     }
-                    if msg.contains("403") || m3.contains("403") {
-                        return Err((
-                            StatusCode::BAD_GATEWAY,
-                            format!("Reddit upstream denied the request. {}", m3),
-                            r3,
-                        ));
-                    }
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        format!("Reddit upstream failed ({}; fallback: {})", msg, m3),
-                        r3,
-                    ))
                 }
             }
         }
     }
+    // 1) ArcticShift primary.
+    match fetch_arctic(state, sub, FILL_LIMIT, epoch_after.as_deref()).await {
+        Ok((videos, cursor)) => {
+            if !videos.is_empty() {
+                debug!(sub = %sub, chain = "fallback", winner = "arctic", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+                return Ok((dedupe_cap(videos), cursor));
+            }
+            empty_ok = empty_ok.or(Some((videos, cursor)));
+        }
+        Err((code, msg, retry_ms)) => {
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                note_429(&mut saw_429, retry_ms);
+            } else {
+                last_err = Some((code, msg, retry_ms));
+            }
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                debug!(sub = %sub, chain = "fallback", leg = "arctic", "mirror leg rate-limited, continuing");
+            }
+        }
+    }
+    // 2) PullPush secondary (never sole source: failure just continues).
+    match fetch_pullpush(state, sub, FILL_LIMIT, epoch_after.as_deref()).await {
+        Ok((videos, cursor)) => {
+            if !videos.is_empty() {
+                debug!(sub = %sub, chain = "fallback", winner = "pullpush", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+                return Ok((dedupe_cap(videos), cursor));
+            }
+            empty_ok = empty_ok.or(Some((videos, cursor)));
+        }
+        Err((code, msg, retry_ms)) => {
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                note_429(&mut saw_429, retry_ms);
+            } else if last_err.is_none() {
+                last_err = Some((code, msg, retry_ms));
+            }
+        }
+    }
+    // 3) Redlib round-robin (t3 cursors).
+    match fetch_redlib(state, sub, FILL_LIMIT, t3_after.as_deref()).await {
+        Ok((videos, after)) => {
+            if !videos.is_empty() {
+                debug!(sub = %sub, chain = "fallback", winner = "redlib", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+                return Ok((dedupe_cap(videos), after));
+            }
+            // Empty redlib page still carries a cursor; prefer it over
+            // epoch cursors when no rows exist anywhere.
+            if empty_ok.is_none() {
+                empty_ok = Some((videos, after));
+            }
+        }
+        Err((code, msg, retry_ms)) => {
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                note_429(&mut saw_429, retry_ms);
+            } else if last_err.is_none() {
+                last_err = Some((code, msg, retry_ms));
+            }
+        }
+    }
+    if authed {
+        // Opt-in legacy legs (script mode only): old.reddit JSON, then www
+        // JSON. Never part of the default no-auth path.
+        match fetch_old_reddit_json(client, &ua, sub, FILL_LIMIT, t3_after.as_deref().or(after)).await {
+            Ok((videos, after)) => {
+                if !videos.is_empty() {
+                    debug!(sub = %sub, chain = "fallback", winner = "old-public", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+                    return Ok((dedupe_cap(videos), after));
+                }
+                if empty_ok.is_none() {
+                    empty_ok = Some((videos, after));
+                }
+            }
+            Err((code, msg, retry_ms)) => {
+                if code == StatusCode::TOO_MANY_REQUESTS {
+                    note_429(&mut saw_429, retry_ms);
+                } else if last_err.is_none() {
+                    last_err = Some((code, msg, retry_ms));
+                }
+            }
+        }
+        match fetch_public_json(client, &ua, sub, FILL_LIMIT, t3_after.as_deref().or(after)).await {
+            Ok((videos, after)) => {
+                if !videos.is_empty() {
+                    debug!(sub = %sub, chain = "fallback", winner = "public(opt-in)", rows = videos.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+                    return Ok((dedupe_cap(videos), after));
+                }
+                if empty_ok.is_none() {
+                    empty_ok = Some((videos, after));
+                }
+            }
+            Err((code, msg, retry_ms)) => {
+                if code == StatusCode::TOO_MANY_REQUESTS {
+                    note_429(&mut saw_429, retry_ms);
+                } else if last_err.is_none() {
+                    last_err = Some((code, msg, retry_ms));
+                }
+            }
+        }
+    }
+    // An empty-but-successful mirror page still fills the timeline (cursor
+    // preserved); prefer a t3 cursor when one exists, else epoch.
+    if let Some((videos, cursor)) = empty_ok {
+        if videos.is_empty() {
+            // Try RSS before settling for an empty page (head fill only).
+            if after.is_none() {
+                let prior = last_err.as_ref().map(|(_, m, _)| m.clone()).unwrap_or_default();
+                match rss_tail(client, &ua, sub, &prior, chain_start).await {
+                    Ok((rvideos, rcursor)) => {
+                        if !rvideos.is_empty() {
+                            return Ok((rvideos, rcursor));
+                        }
+                    }
+                    Err((c3, m3, r3)) => {
+                        if c3 == StatusCode::TOO_MANY_REQUESTS {
+                            note_429(&mut saw_429, r3);
+                        } else if last_err.is_none() {
+                            last_err = Some((c3, m3, r3));
+                        }
+                    }
+                }
+            }
+            // No rows anywhere: surface 429 only when every leg was
+            // rate-limited; otherwise return the (empty) page or the error.
+            if saw_429.is_some() && last_err.is_none() {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Mirrors rate-limited the request".to_string(),
+                    saw_429,
+                ));
+            }
+            if saw_429.is_none() {
+                return Ok((videos, cursor));
+            }
+        }
+    }
+    // RSS has no `after` cursor; only usable for the head fill.
+    if after.is_some() {
+        if let Some((code, msg, retry)) = last_err {
+            return Err((
+                code,
+                format!("Mirror upstream failed for r/{}: {}", sub, msg),
+                retry,
+            ));
+        }
+        if let Some(ms) = saw_429 {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "Mirrors rate-limited the request".to_string(),
+                Some(ms),
+            ));
+        }
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Mirror upstream failed for r/{}", sub),
+            None,
+        ));
+    }
+    let prior = last_err.as_ref().map(|(_, m, _)| m.clone()).unwrap_or_default();
+    match rss_tail(client, &ua, sub, &prior, chain_start).await {
+        Ok(ok) => Ok(ok),
+        Err((c3, m3, r3)) => {
+            if c3 == StatusCode::TOO_MANY_REQUESTS || saw_429.is_some() {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Mirrors rate-limited the request".to_string(),
+                    r3.or(saw_429),
+                ));
+            }
+            if prior.contains("403") || m3.contains("403") {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Mirror upstream denied the request. {}", m3),
+                    r3,
+                ));
+            }
+            Err((
+                StatusCode::BAD_GATEWAY,
+                format!("Mirror upstream failed ({}; fallback: {})", prior, m3),
+                r3,
+            ))
+        }
+    }
 }
 
-/// Fast first-paint HTTP fill for never-fetched subs: public JSON and RSS run
-/// concurrently, each capped at FAST_HTTP_LEG_TIMEOUT (~4s). OAuth is
-/// deliberately skipped here — the token POST would block first paint on a
-/// second sequential timeout chain; it stays deferred to background
-/// enrichment (fetch_http_fallback) after first paint. Returns merged,
-/// deduped rows (public order first, RSS unseen appended) with the public
-/// `after` cursor when known. A 429 from either leg surfaces as 429 when no
-/// rows are available; timeouts are treated as a missed leg, not fatal.
-async fn fetch_http_first_paint(
+/// Shared RSS tail of the fallback chain (head fill only; pagination has no
+/// RSS cursor). Extracted so the authed and unauth paths share one body.
+async fn rss_tail(
     client: &reqwest::Client,
+    ua: &str,
+    sub: &str,
+    prior_msg: &str,
+    chain_start: Instant,
+) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
+    match fetch_rss_fallback(client, ua, sub).await {
+        Ok(all) => {
+            debug!(sub = %sub, chain = "fallback", winner = "rss", rows = all.len(), elapsed_ms = chain_start.elapsed().as_millis() as u64, "http chain end");
+            Ok((dedupe_cap(all), None))
+        }
+        Err((c3, m3, r3)) => {
+            if c3 == StatusCode::TOO_MANY_REQUESTS {
+                return Err((c3, "Reddit rate-limited the request".to_string(), r3));
+            }
+            if prior_msg.contains("403") || m3.contains("403") {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Reddit upstream denied the request. {}", m3),
+                    r3,
+                ));
+            }
+            Err((
+                StatusCode::BAD_GATEWAY,
+                format!("Reddit upstream failed ({}; fallback: {})", prior_msg, m3),
+                r3,
+            ))
+        }
+    }
+}
+
+/// Fast first-paint HTTP fill for never-fetched subs: ArcticShift, PullPush,
+/// Redlib (first host) and RSS run concurrently, each capped at
+/// FAST_HTTP_LEG_TIMEOUT (~4s). OAuth is deliberately skipped here — the
+/// token POST would block first paint on a second sequential timeout chain;
+/// it stays deferred to background enrichment (fetch_http_fallback) after
+/// first paint. Returns merged, deduped rows newest-first by `created_utc`
+/// with the best cursor (t3 from Redlib when present, else oldest epoch).
+/// A 429 from every leg surfaces as 429 when no rows are available; timeouts
+/// are treated as a missed leg, not fatal.
+async fn fetch_http_first_paint(
+    state: &AppState,
     sub: &str,
 ) -> Result<(Vec<VideoItem>, Option<String>), (StatusCode, String, Option<u64>)> {
-    let ua = reddit_ua();
     const FILL_LIMIT: u32 = 100;
     let fp_start = Instant::now();
-    debug!(sub = %sub, chain = "first_paint", "http first-paint start (public+rss parallel)");
-    let (pub_res, rss_res) = tokio::join!(
+    debug!(sub = %sub, chain = "first_paint", "http first-paint start (arctic+pullpush+redlib+rss parallel)");
+    let ua = reddit_ua();
+    let (arctic_res, pullpush_res, redlib_res, rss_res) = tokio::join!(
         tokio::time::timeout(
             FAST_HTTP_LEG_TIMEOUT,
-            fetch_public_json(client, &ua, sub, FILL_LIMIT, None)
+            fetch_arctic(state, sub, FILL_LIMIT, None)
         ),
-        tokio::time::timeout(FAST_HTTP_LEG_TIMEOUT, fetch_rss_fallback(client, &ua, sub)),
+        tokio::time::timeout(
+            FAST_HTTP_LEG_TIMEOUT,
+            fetch_pullpush(state, sub, FILL_LIMIT, None)
+        ),
+        tokio::time::timeout(
+            FAST_HTTP_LEG_TIMEOUT,
+            fetch_redlib(state, sub, FILL_LIMIT, None)
+        ),
+        tokio::time::timeout(FAST_HTTP_LEG_TIMEOUT, fetch_rss_fallback(&state.client, &ua, sub)),
     );
     // Normalize: timeout -> None (leg missed its budget).
     enum Leg<T> {
@@ -984,79 +2130,125 @@ async fn fetch_http_first_paint(
             }
         }
     }
-    let pub_leg: Leg<(Vec<VideoItem>, Option<String>)> = match pub_res {
-        Err(_) => Leg::Timeout,
-        Ok(Ok(ok)) => Leg::Hit(ok),
-        Ok(Err((code, msg, retry))) => {
-            if code == StatusCode::TOO_MANY_REQUESTS {
-                Leg::Miss429(retry)
-            } else {
-                Leg::Miss(msg)
+    fn normalize<T>(res: Result<Result<T, (StatusCode, String, Option<u64>)>, tokio::time::error::Elapsed>) -> Leg<T> {
+        match res {
+            Err(_) => Leg::Timeout,
+            Ok(Ok(ok)) => Leg::Hit(ok),
+            Ok(Err((code, msg, retry))) => {
+                if code == StatusCode::TOO_MANY_REQUESTS {
+                    Leg::Miss429(retry)
+                } else {
+                    Leg::Miss(msg)
+                }
             }
         }
-    };
-    let rss_leg: Leg<Vec<VideoItem>> = match rss_res {
-        Err(_) => Leg::Timeout,
-        Ok(Ok(ok)) => Leg::Hit(ok),
-        Ok(Err((code, msg, retry))) => {
-            if code == StatusCode::TOO_MANY_REQUESTS {
-                Leg::Miss429(retry)
-            } else {
-                Leg::Miss(msg)
-            }
-        }
-    };
-    match (pub_leg, rss_leg) {
-        (Leg::Hit((pvideos, pafter)), Leg::Hit(rvideos)) => {
-            debug!(sub = %sub, chain = "first_paint", public_rows = pvideos.len(), rss_rows = rvideos.len(), elapsed_ms = fp_start.elapsed().as_millis() as u64, "http first-paint end (both legs hit)");
-            if pvideos.is_empty() && rvideos.is_empty() {
-                Ok((Vec::new(), pafter))
-            } else {
-                let extra = filter_unseen_older(&pvideos, rvideos);
-                let mut merged = Vec::with_capacity(pvideos.len() + extra.len());
-                merged.extend(pvideos);
-                merged.extend(extra);
-                Ok((dedupe_cap(merged), pafter))
-            }
-        }
-        (Leg::Hit((pvideos, pafter)), other) => {
-            debug!(sub = %sub, chain = "first_paint", winner = "public", rows = pvideos.len(), other = other.label(), elapsed_ms = fp_start.elapsed().as_millis() as u64, "http first-paint end");
-            Ok((dedupe_cap(pvideos), pafter))
-        }
-        (other, Leg::Hit(rvideos)) => {
-            debug!(sub = %sub, chain = "first_paint", winner = "rss", rows = rvideos.len(), other = other.label(), elapsed_ms = fp_start.elapsed().as_millis() as u64, "http first-paint end");
-            Ok((dedupe_cap(rvideos), None))
-        }
-        (Leg::Miss429(r), Leg::Miss429(_)) => Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "Reddit rate-limited the request".to_string(),
-            r,
-        )),
-        (Leg::Miss429(r), _) | (_, Leg::Miss429(r)) => {
-            // One leg rate-limited while the other missed/timed out with no
-            // rows: surface the 429 so politeness backoff still applies.
-            Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "Reddit rate-limited the request".to_string(),
-                r,
-            ))
-        }
-        (Leg::Miss(m1), Leg::Miss(m2)) => Err((
-            StatusCode::BAD_GATEWAY,
-            format!("Reddit upstream failed ({}; fallback: {})", m1, m2),
-            None,
-        )),
-        (Leg::Miss(m), Leg::Timeout) | (Leg::Timeout, Leg::Miss(m)) => Err((
-            StatusCode::BAD_GATEWAY,
-            format!("Reddit upstream failed: {}", m),
-            None,
-        )),
-        (Leg::Timeout, Leg::Timeout) => Err((
-            StatusCode::BAD_GATEWAY,
-            "Reddit upstream timed out (fast first paint)".to_string(),
-            None,
-        )),
     }
+    let arctic_leg: Leg<(Vec<VideoItem>, Option<String>)> = normalize(arctic_res);
+    let pullpush_leg: Leg<(Vec<VideoItem>, Option<String>)> = normalize(pullpush_res);
+    let redlib_leg: Leg<(Vec<VideoItem>, Option<String>)> = normalize(redlib_res);
+    let rss_leg: Leg<Vec<VideoItem>> = normalize(rss_res);
+    // Collect hits; per-host 429s never block the other legs.
+    let mut pages: Vec<Vec<VideoItem>> = Vec::new();
+    let mut t3_cursor: Option<String> = None;
+    let mut epoch_fallback: Option<String> = None;
+    let mut misses: Vec<String> = Vec::new();
+    let mut saw_429: Option<u64> = None;
+    let mut timeouts = 0u32;
+    for (label, leg) in [
+        ("arctic", arctic_leg.label()),
+        ("pullpush", pullpush_leg.label()),
+        ("redlib", redlib_leg.label()),
+        ("rss", rss_leg.label()),
+    ] {
+        debug!(sub = %sub, chain = "first_paint", leg = label, outcome = leg, "first-paint leg settled");
+    }
+    match arctic_leg {
+        Leg::Hit((v, c)) => {
+            if c.is_some() && epoch_fallback.is_none() {
+                epoch_fallback = c.clone();
+            }
+            if !v.is_empty() {
+                pages.push(v);
+            }
+        }
+        Leg::Miss429(r) => saw_429 = Some(saw_429.map(|m: u64| m.min(r.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))).unwrap_or(r.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))),
+        Leg::Miss(m) => misses.push(format!("arctic: {}", m)),
+        Leg::Timeout => timeouts += 1,
+    }
+    match pullpush_leg {
+        // Never sole source: only merged with other legs, never returned
+        // alone when everything else missed (falls through to error below
+        // unless another leg also hit).
+        Leg::Hit((v, c)) => {
+            if c.is_some() && epoch_fallback.is_none() {
+                epoch_fallback = c.clone();
+            }
+            if !v.is_empty() {
+                pages.push(v);
+            }
+        }
+        Leg::Miss429(r) => saw_429 = Some(saw_429.map(|m: u64| m.min(r.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))).unwrap_or(r.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))),
+        Leg::Miss(m) => misses.push(format!("pullpush: {}", m)),
+        Leg::Timeout => timeouts += 1,
+    }
+    match redlib_leg {
+        Leg::Hit((v, c)) => {
+            if c.is_some() {
+                t3_cursor = c.clone();
+            }
+            if !v.is_empty() {
+                pages.push(v);
+            }
+        }
+        Leg::Miss429(r) => saw_429 = Some(saw_429.map(|m: u64| m.min(r.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))).unwrap_or(r.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))),
+        Leg::Miss(m) => misses.push(format!("redlib: {}", m)),
+        Leg::Timeout => timeouts += 1,
+    }
+    match rss_leg {
+        Leg::Hit(v) => {
+            if !v.is_empty() {
+                pages.push(v);
+            }
+        }
+        Leg::Miss429(r) => saw_429 = Some(saw_429.map(|m: u64| m.min(r.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))).unwrap_or(r.unwrap_or(UPSTREAM_429_COOLDOWN_MS as u64))),
+        Leg::Miss(m) => misses.push(format!("rss: {}", m)),
+        Leg::Timeout => timeouts += 1,
+    }
+    if !pages.is_empty() {
+        let merged = merge_mirror_pages(pages);
+        let cursor = best_cursor(t3_cursor, &merged).or(epoch_fallback);
+        debug!(sub = %sub, chain = "first_paint", rows = merged.len(), has_after = cursor.is_some(), elapsed_ms = fp_start.elapsed().as_millis() as u64, "http first-paint end (mirrors merged)");
+        return Ok((merged, cursor));
+    }
+    // No rows: 429 only when at least one leg was rate-limited and none hit.
+    if saw_429.is_some() && misses.is_empty() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Mirrors rate-limited the request".to_string(),
+            saw_429,
+        ));
+    }
+    if saw_429.is_some() && misses.len() + timeouts as usize >= 3 {
+        // Mixed 429 + failures with no rows: still surface 429 when at
+        // least one mirror explicitly asked for backoff.
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Mirrors rate-limited the request".to_string(),
+            saw_429,
+        ));
+    }
+    if !misses.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Mirror upstream failed ({})", misses.join("; ")),
+            None,
+        ));
+    }
+    Err((
+        StatusCode::BAD_GATEWAY,
+        "Mirror upstream timed out (fast first paint)".to_string(),
+        None,
+    ))
 }
 
 // ---------- stealth headless browser (chromiumoxide) ----------
@@ -1680,10 +2872,12 @@ async fn gate_retry_hint(state: &AppState) -> Option<u64> {
 /// Race, don't sequence: the browser leg (fast ~7s caps, nav slot
 /// reserved, 1s lock timeout so it never queues behind a busy browser)
 /// runs concurrently with the reqwest legs. First paint uses fast parallel
-/// HTTP legs (public JSON + RSS ~4s each via tokio::join, OAuth token POST
-/// skipped/deferred to enrichment) so a never-fetched sub fills in ~4s
-/// instead of stacking sequential 10s timeouts. Enrichment keeps the full
-/// public -> OAuth -> RSS chain with longer budgets.
+/// mirror legs (arctic+pullpush+redlib+rss ~4s each via tokio::join, OAuth
+/// token POST skipped/deferred to enrichment) so a never-fetched sub fills
+/// in ~4s instead of stacking sequential 10s timeouts. Enrichment keeps the
+/// full fallback chain (OAuth-first only when opted in via
+/// REDDIT_AUTH_MODE=script with creds, else mirrors+RSS) with longer
+/// budgets.
 /// The first leg with rows>0 does the head fill; the loser head-merges
 /// unseen rows if it arrives later. BROWSER_BUSY / gate exhaustion just
 /// means the HTTP legs decide alone.
@@ -1715,13 +2909,14 @@ async fn background_head_refresh(state: AppState, sub: String) {
     let first_paint = tl.read().await.posts.is_empty();
     info!(sub = %sub, first_paint = first_paint, "head_refresh start");
     // Chrome-disabled (CI/tests): HTTP-only head fill, no race needed.
-    // First paint uses the fast parallel legs (public+RSS ~4s each, OAuth
-    // skipped); enrichment keeps the full sequential chain + OAuth.
+    // First paint uses the fast parallel mirror legs (arctic+pullpush+
+    // redlib+rss ~4s each, OAuth skipped); enrichment keeps the full
+    // fallback chain (OAuth-first only when opted in, else mirrors+RSS).
     if chrome_disabled() {
         let res = if first_paint {
-            fetch_http_first_paint(&state.client, &sub).await
+            fetch_http_first_paint(&state, &sub).await
         } else {
-            fetch_http_fallback(&state.client, &sub, None).await
+            fetch_http_fallback(&state, &sub, None).await
         };
         match res {
             Ok((posts, after)) => {
@@ -1760,9 +2955,9 @@ async fn background_head_refresh(state: AppState, sub: String) {
             info!(sub = %sub, first_paint = first_paint, retry_after_ms = retry_ms, "nav_gate reserve miss (http-only fallback)");
         }
         let res = if first_paint {
-            fetch_http_first_paint(&state.client, &sub).await
+            fetch_http_first_paint(&state, &sub).await
         } else {
-            fetch_http_fallback(&state.client, &sub, None).await
+            fetch_http_fallback(&state, &sub, None).await
         };
         match res {
             Ok((posts, after)) => {
@@ -1785,20 +2980,21 @@ async fn background_head_refresh(state: AppState, sub: String) {
     debug!(sub = %sub, first_paint = first_paint, lane = if first_paint { "priority" } else { "normal" }, "nav_gate reserve hit");
     // Politeness: the nav slot above covers the browser leg. Race both legs
     // concurrently so HTTP first paint never waits out the ~7s+7s+2s
-    // browser budget. First paint: fast parallel HTTP legs (public+RSS ~4s
-    // each, OAuth skipped); enrichment: full chain with longer budgets.
-    let http_client = state.client.clone();
+    // browser budget. First paint: fast parallel mirror legs (arctic+
+    // pullpush+redlib+rss ~4s each, OAuth skipped); enrichment: full chain
+    // with longer budgets.
+    let http_state = state.clone();
     let sub_http = sub.clone();
     let sub_browser = sub.clone();
     let mut browser_handle =
         tokio::spawn(async move { scrape_sub_via_browser(&sub_browser, true).await });
     let mut http_handle = if first_paint {
         tokio::spawn(
-            async move { fetch_http_first_paint(&http_client, &sub_http).await },
+            async move { fetch_http_first_paint(&http_state, &sub_http).await },
         )
     } else {
         tokio::spawn(
-            async move { fetch_http_fallback(&http_client, &sub_http, None).await },
+            async move { fetch_http_fallback(&http_state, &sub_http, None).await },
         )
     };
 
@@ -2078,7 +3274,7 @@ async fn background_paginate(state: AppState, sub: String) {
     };
     set_loading(&tl, true).await;
     info!(sub = %sub, after = %cursor, "paginate start");
-    match fetch_http_fallback(&state.client, &sub, Some(&cursor)).await {
+    match fetch_http_fallback(&state, &sub, Some(&cursor)).await {
         Ok((posts, next_after)) => {
             let rows = posts.len();
             let has_next = next_after.is_some();
@@ -2437,7 +3633,18 @@ async fn main() {
         inflight: Arc::new(DashMap::new()),
         paginate_inflight: Arc::new(DashMap::new()),
         nav_gate: Arc::new(Mutex::new(NavGate::default())),
+        oauth: Arc::new(OAuthState::default()),
+        mirrors: Arc::new(MirrorState::default()),
     };
+
+    // Startup auth mode (never log secrets — only the mode label).
+    // script = REDDIT_AUTH_MODE=script with complete script creds (opt-in);
+    // no-auth (default) needs no registration and uses the mirror chain.
+    let mode = auth_mode();
+    info!(auth_mode = auth_mode_label(mode), "reddit auth mode");
+    if mode == AuthMode::Script && !is_script_ua(&reddit_ua()) {
+        warn!("REDDIT_USER_AGENT is not a script UA (`<platform>:<appID>:<version> by /u/<username>`); Reddit may throttle or reject OAuth traffic");
+    }
 
     let api = Router::new()
         .route("/healthz", get(healthz))
@@ -2810,7 +4017,7 @@ mod unit_tests {
         )
         .await;
         assert!(
-            rate_limit_remaining_ms(&tl.read().await, now_ms()).is_none(),
+            rate_limit_remaining_ms(&*tl.read().await, now_ms()).is_none(),
             "successful fill must clear the 429 cooldown"
         );
     }
@@ -2825,10 +4032,382 @@ mod unit_tests {
             Some(60_000),
         )
         .await;
-        let remain = rate_limit_remaining_ms(&tl.read().await, now_ms()).unwrap();
+        let remain = rate_limit_remaining_ms(&*tl.read().await, now_ms()).unwrap();
         assert!(
             remain > 50_000 && remain <= 60_000,
             "Retry-After 60s must drive cooldown, got {remain}"
         );
+    }
+
+    // ---------- OAuth (offline-safe: no live Reddit calls) ----------
+
+    #[test]
+    fn token_ttl_subtracts_60s_skew_with_floor() {
+        // 3600s grant caches for 3540s.
+        assert_eq!(token_ttl_secs(3600), 3540);
+        // Tiny expires_in never hot-loops: floored at the minimum TTL.
+        assert_eq!(token_ttl_secs(30), OAUTH_MIN_CACHED_TTL_SECS);
+        assert_eq!(token_ttl_secs(0), OAUTH_MIN_CACHED_TTL_SECS);
+        assert_eq!(token_ttl_secs(61), OAUTH_MIN_CACHED_TTL_SECS.max(1));
+    }
+
+    #[test]
+    fn token_cache_validity_is_time_bound() {
+        let now = now_ms();
+        assert!(token_cache_valid(now + 60_000, now));
+        assert!(!token_cache_valid(now - 1, now));
+        assert!(!token_cache_valid(now, now));
+    }
+
+    #[test]
+    fn cached_token_valid_until_expiry() {
+        let fresh = CachedToken {
+            token: "t".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+        };
+        assert!(fresh.valid());
+        let stale = CachedToken {
+            token: "t".to_string(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(!stale.valid());
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_lock_is_single_flight() {
+        // The refresh mutex must serialize concurrent refresh attempts:
+        // a second try_lock while the first holds it fails fast (coalesce),
+        // and succeeds once released. No network involved.
+        let oauth = OAuthState::default();
+        let guard = oauth.refresh.lock().await;
+        assert!(
+            oauth.refresh.try_lock().is_err(),
+            "concurrent refresh must coalesce (single-flight)"
+        );
+        drop(guard);
+        assert!(
+            oauth.refresh.try_lock().is_ok(),
+            "refresh lock must release after first refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_cached_token_short_circuits_refresh() {
+        // A valid cached token is returned without touching the network
+        // (no creds in env needed): proves the fast path is network-free.
+        let oauth = OAuthState::default();
+        *oauth.cached.lock().await = Some(CachedToken {
+            token: "cached-bearer".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(300),
+        });
+        let client = reqwest::Client::builder().build().unwrap();
+        let got = oauth_bearer_token(&oauth, &client, "test-ua").await;
+        assert_eq!(got.as_deref(), Some("cached-bearer"));
+    }
+
+    #[test]
+    fn oauth_listings_url_builder_shape() {
+        assert_eq!(
+            oauth_listings_url("videos", "new", 100, None),
+            "https://oauth.reddit.com/r/videos/new.json?raw_json=1&limit=100"
+        );
+        assert_eq!(
+            oauth_listings_url("videos", "hot", 25, Some("t3_abc123")),
+            "https://oauth.reddit.com/r/videos/hot.json?raw_json=1&limit=25&after=t3_abc123"
+        );
+        // Empty cursor is omitted, never rendered as `after=`.
+        assert!(
+            !oauth_listings_url("videos", "new", 100, Some("")).contains("after=")
+        );
+    }
+
+    #[test]
+    fn public_json_url_builder_hosts() {
+        assert_eq!(
+            public_json_url("www.reddit.com", "videos", 100, None),
+            "https://www.reddit.com/r/videos/new.json?limit=100&raw_json=1"
+        );
+        assert_eq!(
+            public_json_url("old.reddit.com", "videos", 100, Some("t3_x")),
+            "https://old.reddit.com/r/videos/new.json?limit=100&raw_json=1&after=t3_x"
+        );
+    }
+
+    #[test]
+    fn script_ua_format_is_reddit_compliant() {
+        // Script UAs look like `<platform>:<appID>:<version> by /u/<username>`.
+        let ua = script_default_ua(Some("someuser"));
+        assert!(is_script_ua(&ua), "script UA must contain ' by /u/': {ua}");
+        assert!(ua.contains("someuser"), "script UA must name the user: {ua}");
+        assert!(is_script_ua("linux:redditv:0.1.0 by /u/someuser"));
+        // Legacy parenthesized form is not a script UA.
+        assert!(!is_script_ua(DEFAULT_UA));
+    }
+
+    #[test]
+    fn oauth_creds_require_all_four_fields() {
+        let full = || {
+            oauth_creds_from(
+                Some("id".to_string()),
+                Some("secret".to_string()),
+                Some("user".to_string()),
+                Some("pass".to_string()),
+            )
+        };
+        assert!(full().is_some());
+        assert!(
+            oauth_creds_from(None, Some("s".into()), Some("u".into()), Some("p".into())).is_none(),
+            "missing client_id must yield no creds (creds-absent fallback)"
+        );
+        assert!(
+            oauth_creds_from(Some("id".into()), None, Some("u".into()), Some("p".into())).is_none()
+        );
+        assert!(
+            oauth_creds_from(Some("id".into()), Some("s".into()), None, Some("p".into())).is_none()
+        );
+        assert!(
+            oauth_creds_from(Some("id".into()), Some("s".into()), Some("u".into()), None).is_none()
+        );
+        assert!(
+            oauth_creds_from(Some("".into()), Some("s".into()), Some("u".into()), Some("p".into())).is_none(),
+            "empty fields must yield no creds"
+        );
+    }
+
+    #[test]
+    fn auth_mode_script_is_opt_in_default_no_auth() {
+        // No registration needed by default: unset/other values are no-auth
+        // even when creds happen to be present. OAuth runs only with
+        // REDDIT_AUTH_MODE=script AND complete creds.
+        assert_eq!(auth_mode_from(None, true), AuthMode::NoAuth);
+        assert_eq!(auth_mode_from(None, false), AuthMode::NoAuth);
+        assert_eq!(auth_mode_from(Some("none"), true), AuthMode::NoAuth);
+        assert_eq!(auth_mode_from(Some("NONE"), true), AuthMode::NoAuth);
+        assert_eq!(auth_mode_from(Some("SCRIPT"), true), AuthMode::Script);
+        assert_eq!(auth_mode_from(Some("script"), true), AuthMode::Script);
+        assert_eq!(auth_mode_from(Some("script"), false), AuthMode::NoAuth);
+        assert_eq!(auth_mode_from(Some("none"), false), AuthMode::NoAuth);
+        assert_eq!(auth_mode_from(Some(""), true), AuthMode::NoAuth);
+    }
+
+    // ---------- No-auth mirrors (offline-safe: URL builders + field maps) ----------
+
+    #[test]
+    fn arctic_search_url_builder_shape() {
+        assert_eq!(
+            arctic_search_url("videos", 100, None),
+            "https://arctic-shift.photon-reddit.com/api/posts/search?subreddit=videos&sort=desc&limit=100&fields=title,url,id,subreddit,created_utc,author,score,num_comments"
+        );
+        assert_eq!(
+            arctic_search_url("videos", 25, Some("1700000000")),
+            "https://arctic-shift.photon-reddit.com/api/posts/search?subreddit=videos&sort=desc&limit=25&fields=title,url,id,subreddit,created_utc,author,score,num_comments&after=1700000000"
+        );
+        // Empty cursor omitted, never rendered as `after=`.
+        assert!(!arctic_search_url("videos", 100, Some("")).contains("after="));
+        assert!(!arctic_search_url("videos", 100, None).contains("www.reddit.com"));
+        assert!(!arctic_search_url("videos", 100, None).contains("oauth.reddit.com"));
+    }
+
+    #[test]
+    fn arctic_maps_id_to_synthesized_permalink_and_yt_thumb() {
+        let resp: ArcticResponse = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": "abc123", "title": "Cool vid", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "subreddit": "videos", "created_utc": 1700000000.0, "author": "u1"},
+                {"id": "t3_def456", "title": "Short", "url": "https://youtu.be/abcdefghijk", "subreddit": "videos", "created_utc": 1700000100.0, "author": "u2"},
+                {"id": "nope1", "title": "Not youtube", "url": "https://example.com/x", "subreddit": "videos", "created_utc": 1700000200.0, "author": "u3"},
+                {"id": "", "title": "No id", "url": "https://www.youtube.com/watch?v=zzzzzzzzzzz", "subreddit": "videos", "created_utc": 1700000300.0, "author": "u4"}
+            ]
+        }))
+        .unwrap();
+        let (videos, cursor) = videos_from_arctic(&resp, "videos");
+        // Non-YouTube + id-less rows filtered.
+        assert_eq!(videos.len(), 2);
+        // Newest-first by created_utc.
+        assert_eq!(videos[0].youtube_id, "abcdefghijk");
+        assert_eq!(
+            videos[0].reddit_url,
+            "https://www.reddit.com/r/videos/comments/def456/"
+        );
+        assert_eq!(videos[0].reddit_id.as_deref(), Some("t3_def456"));
+        assert_eq!(
+            videos[0].thumbnail,
+            "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg"
+        );
+        assert_eq!(videos[1].reddit_id.as_deref(), Some("t3_abc123"));
+        assert_eq!(
+            videos[1].reddit_url,
+            "https://www.reddit.com/r/videos/comments/abc123/"
+        );
+        // Epoch cursor = oldest created_utc seen.
+        assert_eq!(cursor.as_deref(), Some("1700000000"));
+    }
+
+    #[test]
+    fn pullpush_search_url_builder_shape() {
+        assert_eq!(
+            pullpush_search_url("videos", 100, None),
+            "https://api.pullpush.io/reddit/search/submission/?subreddit=videos&sort=desc&sort_type=created_utc&size=100"
+        );
+        assert_eq!(
+            pullpush_search_url("videos", 50, Some("1700000000")),
+            "https://api.pullpush.io/reddit/search/submission/?subreddit=videos&sort=desc&sort_type=created_utc&size=50&before=1700000000"
+        );
+        assert!(!pullpush_search_url("videos", 100, Some("")).contains("before="));
+        assert!(!pullpush_search_url("videos", 100, None).contains("reddit.com"));
+    }
+
+    #[test]
+    fn pullpush_direct_field_map() {
+        let resp: PullPushResponse = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": "ghi789", "title": "PP vid", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                 "permalink": "/r/videos/comments/ghi789/slug/", "thumbnail": "https://cdn.example.com/t.jpg", "created_utc": 1700000500.0},
+                {"id": "jkl012", "title": "", "url": "https://youtu.be/AAAAAAAAAAA",
+                 "permalink": "https://www.reddit.com/r/videos/comments/jkl012/slug/", "thumbnail": "self", "created_utc": 1700000400.0},
+                {"id": "x", "title": "No yt", "url": "https://example.com/", "permalink": "/r/videos/comments/x/", "thumbnail": "", "created_utc": 1700000600.0}
+            ]
+        }))
+        .unwrap();
+        let (videos, cursor) = videos_from_pullpush(&resp);
+        assert_eq!(videos.len(), 2, "non-YouTube rows filtered");
+        assert_eq!(videos[0].youtube_id, "dQw4w9WgXcQ");
+        // Direct permalink + thumbnail passthrough.
+        assert_eq!(
+            videos[0].reddit_url,
+            "https://www.reddit.com/r/videos/comments/ghi789/slug/"
+        );
+        assert_eq!(videos[0].thumbnail, "https://cdn.example.com/t.jpg");
+        // Missing/placeholder thumbnail falls back to YouTube hqdefault.
+        assert_eq!(
+            videos[1].thumbnail,
+            "https://i.ytimg.com/vi/AAAAAAAAAAA/hqdefault.jpg"
+        );
+        assert_eq!(videos[1].title, "Untitled");
+        assert_eq!(cursor.as_deref(), Some("1700000400"));
+    }
+
+    #[test]
+    fn redlib_url_builder_and_rotation_order() {
+        assert_eq!(
+            redlib_url("safereddit.com", "videos", 100, None),
+            "https://safereddit.com/r/videos/new.json?limit=100&raw_json=1"
+        );
+        assert_eq!(
+            redlib_url("redlib.cow.rip", "videos", 25, Some("t3_abc")),
+            "https://redlib.cow.rip/r/videos/new.json?limit=25&raw_json=1&after=t3_abc"
+        );
+        // Round-robin: start index rotates, order preserved, all hosts tried.
+        assert_eq!(
+            redlib_order(0),
+            vec!["safereddit.com", "redlib.catsarch.com", "redlib.r4fo.com", "redlib.cow.rip"]
+        );
+        assert_eq!(
+            redlib_order(1),
+            vec!["redlib.catsarch.com", "redlib.r4fo.com", "redlib.cow.rip", "safereddit.com"]
+        );
+        assert_eq!(redlib_order(4), redlib_order(0), "wraps around");
+        assert_eq!(redlib_cooldown_key("safereddit.com"), "redlib:safereddit.com");
+    }
+
+    #[test]
+    fn cursor_split_prefers_epoch_for_mirrors_t3_for_redlib() {
+        assert_eq!(split_after_cursor(None), (None, None));
+        assert_eq!(split_after_cursor(Some("")), (None, None));
+        assert_eq!(
+            split_after_cursor(Some("1700000000")),
+            (Some("1700000000".to_string()), None)
+        );
+        assert_eq!(
+            split_after_cursor(Some("t3_abc123")),
+            (None, Some("t3_abc123".to_string()))
+        );
+        // Best cursor: t3 wins when present, else oldest epoch.
+        let posts = vec![
+            VideoItem {
+                youtube_id: "a".into(),
+                youtube_url: "u".into(),
+                title: "t".into(),
+                reddit_url: "r".into(),
+                thumbnail: "th".into(),
+                created_utc: Some(1700000200),
+                reddit_id: None,
+            },
+            VideoItem {
+                youtube_id: "b".into(),
+                youtube_url: "u".into(),
+                title: "t".into(),
+                reddit_url: "r".into(),
+                thumbnail: "th".into(),
+                created_utc: Some(1700000100),
+                reddit_id: None,
+            },
+        ];
+        assert_eq!(
+            best_cursor(Some("t3_x".to_string()), &posts).as_deref(),
+            Some("t3_x")
+        );
+        assert_eq!(
+            best_cursor(None, &posts).as_deref(),
+            Some("1700000100")
+        );
+        assert_eq!(best_cursor(None, &[]), None);
+    }
+
+    #[test]
+    fn mirror_pages_merge_newest_first_deduped() {
+        let a = vec![VideoItem {
+            youtube_id: "aaa111aaa11".into(),
+            youtube_url: "https://www.youtube.com/watch?v=aaa111aaa11".into(),
+            title: "old".into(),
+            reddit_url: "https://www.reddit.com/r/v/comments/1/".into(),
+            thumbnail: youtube_thumb("aaa111aaa11"),
+            created_utc: Some(100),
+            reddit_id: Some("t3_1".into()),
+        }];
+        let b = vec![
+            VideoItem {
+                youtube_id: "bbb222bbb22".into(),
+                youtube_url: "https://www.youtube.com/watch?v=bbb222bbb22".into(),
+                title: "new".into(),
+                reddit_url: "https://www.reddit.com/r/v/comments/2/".into(),
+                thumbnail: youtube_thumb("bbb222bbb22"),
+                created_utc: Some(200),
+                reddit_id: Some("t3_2".into()),
+            },
+            VideoItem {
+                youtube_id: "aaa111aaa11".into(),
+                youtube_url: "https://www.youtube.com/watch?v=aaa111aaa11".into(),
+                title: "old dupe".into(),
+                reddit_url: "https://www.reddit.com/r/v/comments/1/".into(),
+                thumbnail: youtube_thumb("aaa111aaa11"),
+                created_utc: Some(100),
+                reddit_id: Some("t3_1".into()),
+            },
+        ];
+        let merged = merge_mirror_pages(vec![a, b]);
+        let ids: Vec<&str> = merged.iter().map(|v| v.youtube_id.as_str()).collect();
+        assert_eq!(ids, vec!["bbb222bbb22", "aaa111aaa11"]);
+    }
+
+    #[test]
+    fn mirror_cooldowns_are_per_host() {
+        let mirrors = MirrorState::default();
+        mirror_set_cooldown(&mirrors, "redlib:safereddit.com", Some(60_000));
+        // Same host cools down…
+        assert!(mirror_cooldown_remaining(&mirrors, "redlib:safereddit.com", now_ms()).is_some());
+        // …other hosts and mirrors are unaffected.
+        assert!(mirror_cooldown_remaining(&mirrors, "redlib:redlib.cow.rip", now_ms()).is_none());
+        assert!(mirror_cooldown_remaining(&mirrors, "arctic", now_ms()).is_none());
+        assert!(mirror_cooldown_remaining(&mirrors, "pullpush", now_ms()).is_none());
+    }
+
+    #[test]
+    fn ratelimit_reset_header_parses_to_ms() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert("x-ratelimit-reset", HeaderValue::from_static("12.5"));
+        assert_eq!(ratelimit_reset_ms(&h), Some(12_500));
+        let empty = HeaderMap::new();
+        assert_eq!(ratelimit_reset_ms(&empty), None);
     }
 }

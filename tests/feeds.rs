@@ -50,6 +50,9 @@ impl TestServer {
             .env_remove("REDDIT_USER")
             .env_remove("REDDIT_USERNAME_OVERRIDE")
             .env_remove("REDDIT_PASSWORD")
+            .env_remove("REDDIT_USER_AGENT")
+            .env_remove("REDDIT_UA")
+            .env_remove("REDDIT_AUTH_MODE")
             .current_dir(env!("CARGO_MANIFEST_DIR")) // ServeDir("static") is cwd-relative
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

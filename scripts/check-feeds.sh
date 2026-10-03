@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Manual live verification for reddittv feeds.
 # Usage: ./scripts/check-feeds.sh [base_url]   (default http://localhost:3000)
+#
+# No-auth by default (mirror chain: ArcticShift -> PullPush -> Redlib ->
+# RSS -> browser); no Reddit registration needed.
+#
+# OAuth note (opt-in only): with REDDIT_AUTH_MODE=script plus
+# REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD set (see .env.example, app type
+# `script` at https://www.reddit.com/prefs/apps), the server logs
+# `auth_mode=script` at startup; run the server with RUST_LOG=debug and look
+# for `winner="oauth"` to confirm the authenticated leg served the feed.
 set -u
 BASE="${1:-http://localhost:3000}"
 FAIL=0
